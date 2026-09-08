@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "root": "/var/lib/homebridge/roborockPauseSchedules",
+  "homebridge": {
+    "baseUrl": "http://127.0.0.1:8581",
+    "legacyTokenFile": "/var/lib/homebridge/roborockPauseSchedules/homebridge-access-token",
+    "tokenFile": "/var/lib/homebridge/roborockPauseSchedules/controller/homebridge-access-token",
+    "credentialsFile": "/var/lib/homebridge/roborockPauseSchedules/controller/homebridge-api-credentials.json"
+  },
+  "systemd": {
+    "user": "homebridge",
+    "group": "homebridge",
+    "bashPath": "/usr/bin/bash",
+    "homebridgeUnit": "homebridge.service",
+    "onCalendar": "*-*-* 00:05:00"
+  },
+  "vacuums": [
+    {
+      "id": "downstairs",
+      "displayName": "Downstairs",
+      "scheduleNamePrefix": "Downstairs Roborock Schedule ",
+      "cleaningServiceName": "Downstairs Roborock Cleaning",
+      "dockedServiceName": "Downstairs Roborock Docked",
+      "returnToDockServiceName": "Downstairs Roborock Return to Dock"
+    }
+  ]
+}

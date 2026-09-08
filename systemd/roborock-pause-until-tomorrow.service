@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore Roborock schedules paused until tomorrow
+After=network-online.target homebridge.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=homebridge
+Group=homebridge
+WorkingDirectory=/var/lib/homebridge/roborockPauseSchedules
+ExecStart=/usr/bin/bash /var/lib/homebridge/roborockPauseSchedules/all-vacuums-pause-expire.sh

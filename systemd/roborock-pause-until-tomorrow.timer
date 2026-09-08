@@ -1,0 +1,10 @@
+[Unit]
+Description=Restore Roborock schedules shortly after midnight
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+Unit=roborock-pause-until-tomorrow.service
+
+[Install]
+WantedBy=timers.target
