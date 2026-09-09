@@ -8,6 +8,7 @@ Homebridge API.
 
 You do **not** need to fork this repository or know how to program. Choose one
 of the download methods below, then follow the fresh-install checklist.
+Already installed? Go to [Upgrade an existing installation](#upgrade-an-existing-installation).
 
 ## Before you begin
 
@@ -219,6 +220,65 @@ python3 controller/all-vacuums-pause-controller.py status
 `planning` or `settling` means work remains; `complete` means the exposed values
 passed the observation window; `needs-attention` means a disagreement or error
 needs investigation. `complete` is still best-effort, not cloud-authoritative proof.
+
+## Upgrade an existing installation
+
+Use the [ZIP/separate-runtime guide](docs/ZIP_UPGRADE.md) when the running folder
+has no `.git`, or the [managed Git upgrade guide](docs/MANAGED_UPGRADE.md) when
+the running folder itself is a checkout. Do not repeat the fresh-install commands
+against an existing installation.
+
+A development checkout such as
+`/var/lib/homebridge/roborockPauseSchedulesSource` and the live directory
+`/var/lib/homebridge/roborockPauseSchedules` are separate directories.
+Fetching a release into the source checkout does not update the scripts that
+Script2 runs. Deploy the reviewed runtime files into the existing live directory,
+preserving its registry, manifest, credentials, saved states, recovery snapshots,
+and command paths.
+
+### Moving from v1.0.1 to v1.0.2
+
+1. Finish or resolve pending pause/restore operations before copying files.
+   Check the local `status` output; an optimistic OFF switch alone does not prove
+   restoration completed. Stop the reconciliation timer and wait for running
+   services and workers to finish, following the upgrade guide.
+2. Make a private backup outside the live directory. Compare runtime code with
+   the reviewed release before deploying; preserve any local code changes for
+   review.
+3. If a guarded deployment stops on a customized `README.md`, that indicates
+   a documentation difference. Preserve that live README and deploy the reviewed
+   controller files separately. Keep all runtime-code and state checks in place.
+   The current public instructions remain available in the source checkout and
+   on GitHub. Treat other customized documentation the same way.
+4. Verify the deployed controller files against the release, then run the local
+   installation validation and state checks below.
+5. Resume the existing reconciliation timer and inspect its first service result.
+   The v1.0.1 units also work with v1.0.2: no unit replacement, `daemon-reload`,
+   or Homebridge restart is needed for this controller-only update. Keep the
+   optional midnight timer's configuration and prior enabled state.
+
+From the live directory, as its runtime owner:
+
+```bash
+python3 install-roborock-pause.py verify
+python3 controller/all-vacuums-pause-controller.py status
+bash all-vacuums-pause-state.sh
+```
+
+Each command must succeed. Installation validation checks configuration and
+managed files; also compare the deployed
+`controller/schedule_pause_controller.py` and
+`controller/all-vacuums-pause-controller.py` with the reviewed release to confirm
+the new code is actually live. After resuming reconciliation, use
+[Verify and troubleshoot](#verify-and-troubleshoot) to check that the timer is
+active and the service reports `Result=success` and `ExecMainStatus=0`.
+A successful maintenance run is not proof of robot-side command completion.
+
+v1.0.2 stops the old indefinite audits when it encounters saved v1.0.1 operations.
+New pause and restore requests receive a three-minute window; afterward, timer
+ticks inspect local files only. The timer can remain active all night without
+this controller repeatedly reading Homebridge. Other Homebridge clients, plugin
+activity, or opening the Home app can still trigger schedule reads.
 
 ## Everyday use
 
