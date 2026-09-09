@@ -209,16 +209,111 @@ deleting them. Full safety and rollback details are in
 
 ## Optional automatic expiration timer
 
-The supplied systemd timer runs at 00:05 local time. Render the files first so
-you can review them:
+The optional systemd timer automatically restores paused schedules shortly
+after midnight. By default it runs at **00:05 in the Homebridge host's local
+time zone**.
+
+The timer works together with the pause switches as follows:
+
+| Action or switch | Effect |
+|---|---|
+| Turn an individual vacuum's pause switch ON | Saves that vacuum's current schedule states and pauses its schedules. |
+| Turn an individual vacuum's pause switch OFF | Immediately restores only that vacuum's saved schedule states. |
+| Turn Pause All ON | Pauses every configured vacuum. |
+| Turn Pause All OFF | Immediately restores every active pause, including pauses started with an individual switch. |
+| Leave Pause Until Tomorrow ON | Allows the systemd timer to restore all active pauses when the timer runs. |
+| Turn Pause Until Tomorrow OFF | The timer still runs, but exits without changing any pause. Pauses remain active until manually restored. |
+
+Pause Until Tomorrow is a persistent preference, not a pause command. It
+defaults to ON until you turn it OFF. Turning it ON does not pause a vacuum,
+and turning it OFF does not immediately restore one. The preference remains
+ON after an automatic restoration, so future pauses will also expire after
+midnight unless you turn the switch OFF.
+
+The Pause All state is ON whenever at least one configured vacuum has an active
+pause. When automatic expiration runs, it performs the same aggregate restore
+operation as turning Pause All OFF.
+
+### Render and review the units
+
+Run the renderer from the installed project directory. It reads the installation
+root, Homebridge service name, execution user, and timer schedule from
+`controller/vacuums.json`.
+
+Use a new temporary output directory because the renderer intentionally refuses
+to replace existing output:
 
 ```bash
-python3 render-systemd-units.py --output /tmp/roborock-systemd
+cd /var/lib/homebridge/roborockPauseSchedules
+render_directory="$(mktemp -d /tmp/roborock-systemd.XXXXXX)"
+
+python3 render-systemd-units.py --output "$render_directory"
+
+sed -n '1,200p'   "$render_directory/roborock-pause-until-tomorrow.service"
+sed -n '1,200p'   "$render_directory/roborock-pause-until-tomorrow.timer"
 ```
 
-The renderer never runs `systemctl` and never replaces existing output. See
-the generated files in `/tmp/roborock-systemd` before installing and enabling
-them yourself.
+The renderer only creates files for review. It never invokes `systemctl` or
+writes to `/etc/systemd/system`.
+
+The generated service:
+
+- runs once as the configured Homebridge user and group;
+- invokes `all-vacuums-pause-expire.sh` from the installed project directory;
+- restores all active pauses when Pause Until Tomorrow is ON; and
+- exits successfully without changing pauses when Pause Until Tomorrow is OFF.
+
+The generated timer uses `Persistent=true`. If the computer was off or the
+timer was inactive at 00:05, systemd may run the missed expiration shortly
+after the timer is next started. Before enabling it, restore any pause that
+should remain active or turn Pause Until Tomorrow OFF.
+
+### Install and enable the timer
+
+After reviewing both rendered files, install them as root:
+
+```bash
+sudo install -o root -g root -m 0644   "$render_directory/roborock-pause-until-tomorrow.service"   /etc/systemd/system/roborock-pause-until-tomorrow.service
+
+sudo install -o root -g root -m 0644   "$render_directory/roborock-pause-until-tomorrow.timer"   /etc/systemd/system/roborock-pause-until-tomorrow.timer
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now roborock-pause-until-tomorrow.timer
+```
+
+Enable the `.timer` unit only. The timer starts the oneshot `.service` whenever
+expiration is due; the service does not need to remain enabled or running.
+
+### Verify scheduling and operation
+
+```bash
+systemctl is-enabled roborock-pause-until-tomorrow.timer
+systemctl is-active roborock-pause-until-tomorrow.timer
+systemctl list-timers --all roborock-pause-until-tomorrow.timer
+systemctl status roborock-pause-until-tomorrow.timer --no-pager
+```
+
+`list-timers` shows the next scheduled run using the host's configured time
+zone. Use `timedatectl status` if the displayed time is unexpected.
+
+After the service has run, inspect its most recent result with:
+
+```bash
+systemctl status roborock-pause-until-tomorrow.service --no-pager
+journalctl   -u roborock-pause-until-tomorrow.service   --since today   --no-pager
+```
+
+To test expiration immediately, first decide whether active pauses should be
+restored. Starting the service manually performs a real expiration check:
+
+```bash
+sudo systemctl start roborock-pause-until-tomorrow.service
+systemctl status roborock-pause-until-tomorrow.service --no-pager
+```
+
+If Pause Until Tomorrow is ON, that test restores all active pauses. If it is
+OFF, the service reports that automatic expiration is disabled and changes
+nothing.
 
 ## Script and file guide
 
