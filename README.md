@@ -249,8 +249,10 @@ render_directory="$(mktemp -d /tmp/roborock-systemd.XXXXXX)"
 
 python3 render-systemd-units.py --output "$render_directory"
 
-sed -n '1,200p'   "$render_directory/roborock-pause-until-tomorrow.service"
-sed -n '1,200p'   "$render_directory/roborock-pause-until-tomorrow.timer"
+sed -n '1,200p' \
+  "$render_directory/roborock-pause-until-tomorrow.service"
+sed -n '1,200p' \
+  "$render_directory/roborock-pause-until-tomorrow.timer"
 ```
 
 The renderer only creates files for review. It never invokes `systemctl` or
@@ -273,9 +275,13 @@ should remain active or turn Pause Until Tomorrow OFF.
 After reviewing both rendered files, install them as root:
 
 ```bash
-sudo install -o root -g root -m 0644   "$render_directory/roborock-pause-until-tomorrow.service"   /etc/systemd/system/roborock-pause-until-tomorrow.service
+sudo install -o root -g root -m 0644 \
+  "$render_directory/roborock-pause-until-tomorrow.service" \
+  /etc/systemd/system/roborock-pause-until-tomorrow.service
 
-sudo install -o root -g root -m 0644   "$render_directory/roborock-pause-until-tomorrow.timer"   /etc/systemd/system/roborock-pause-until-tomorrow.timer
+sudo install -o root -g root -m 0644 \
+  "$render_directory/roborock-pause-until-tomorrow.timer" \
+  /etc/systemd/system/roborock-pause-until-tomorrow.timer
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now roborock-pause-until-tomorrow.timer
@@ -300,7 +306,10 @@ After the service has run, inspect its most recent result with:
 
 ```bash
 systemctl status roborock-pause-until-tomorrow.service --no-pager
-journalctl   -u roborock-pause-until-tomorrow.service   --since today   --no-pager
+journalctl \
+  -u roborock-pause-until-tomorrow.service \
+  --since today \
+  --no-pager
 ```
 
 To test expiration immediately, first decide whether active pauses should be
