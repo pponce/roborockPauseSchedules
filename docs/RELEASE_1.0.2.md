@@ -6,15 +6,17 @@ Homebridge plugin's schedule cache throughout the night.
 
 ## Changes
 
-- Each pause or restore request gets a fixed ten-minute verification window.
+- Each pause or restore request gets a fixed three-minute verification window.
   Pause All covers affected vacuums; individual requests open only their own window.
 - The existing one-minute timer checks local files when idle. Outside a window,
   it makes no Homebridge requests, schedule writes, or docking requests.
-- Matching observations cannot settle before six minutes, allowing time beyond
-  the plugin's default five-minute cache. Three matching observations spanning at
-  least two minutes are still required. This remains best-effort verification.
+- Three matching observations spanning at least two minutes are required. There
+  is no extra wait for the plugin's five-minute cache: schedule writes already
+  trigger a fresh cloud verification read that updates its switches and cache.
+  The ordinary interface still does not expose a separate completion signal.
 - Mismatched schedules retain the three-attempt budget and two-minute retry
-  spacing. Once settled, further checks within the window are read-only.
+  spacing, subject to the earlier three-minute deadline. A slow queue or recovery
+  may outlast the window and require an explicit retry. Once settled, further checks within the window are read-only.
 - Expiry preserves snapshots and marks unfinished work `needs-attention`.
   Restarting the controller or timer cannot extend the deadline. An explicit
   retry can open a new window, preserving the original restore targets.
@@ -38,12 +40,12 @@ the reconciliation timer installed using the README instructions.
 
 ## Verification limits
 
-The deterministic suite covers deadlines, late rollback after the cache interval,
+The deterministic suite covers deadlines, early settlement and delayed rollback,
 initial discovery outages, restore planning, explicit retries, restart, old journal
 migration, and requests crossing a deadline. ZIP packaging and checksums are also
 validated. These tests do not establish robot-side confirmation or a live household
 soak test for this release.
 
-After ten minutes, status reflects the last observation. Later cloud rollbacks or
+After three minutes, status reflects the last observation. Later cloud rollbacks or
 manual edits are not detected automatically. Recovery files remain available;
 restore or explicitly retry if the displayed result disagrees with the robot.

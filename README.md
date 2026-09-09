@@ -296,7 +296,7 @@ Two independent timers serve different purposes:
 | `roborock-pause-until-tomorrow.timer` | Requests restoration of active pauses when Pause Until Tomorrow is ON. | Optional; 00:05 local time by default. |
 
 Keep reconciliation enabled even if you disable Pause Until Tomorrow. Each pause
-or restore request opens a **ten-minute verification window for the affected
+or restore request opens a **three-minute verification window for the affected
 vacuum**. Timer ticks observe Homebridge approximately once per minute during that
 window. Outside it, they inspect local files only: **no Homebridge reads, schedule
 writes, or docking requests**. Completed restores no longer cause overnight audits.
@@ -540,25 +540,29 @@ and snapshot and checks again using the existing Homebridge API; no separate
 Roborock login or plugin-specific API is required.
 
 Enable `roborock-pause-reconcile.timer` after deploying the runtime. Each user
-pause or restore, including a midnight restore, has a fixed ten-minute deadline
+pause or restore, including a midnight restore, has a fixed three-minute deadline
 persisted before discovery. Pause All creates a window for each affected vacuum;
 a single-vacuum request does not start monitoring for other vacuums. Homebridge's
 accessories endpoint may itself read accessories belonging to other vacuums.
 
-Settlement requires at least three matching observations spanning two minutes,
-and cannot happen before six minutes from the request. This allows time beyond
-the plugin's default five-minute schedule cache. Cached values and background
-refreshes mean this is still best-effort verification, not guaranteed completion.
+Settlement requires at least three matching observations spanning two minutes.
+The Roborock Homebridge plugin performs a fresh cloud read after its queued write
+batch and updates its cache and switches from that result. The ordinary five-minute
+read cache does not delay that write verification, so the controller need not wait
+for its TTL to expire. Its own observations still cannot distinguish an optimistic
+value from a confirmed one; this remains best-effort verification.
 Avoid editing schedules manually while an operation is settling. Only mismatched
 schedules are retried, at least two minutes apart, with at most three attempts per
-schedule per operation. After settlement, remaining checks in the same window
+schedule per operation, subject to the earlier three-minute deadline. Slow queueing
+or recovery can exceed that window; an unobserved result needs an explicit retry.
+After settlement, remaining checks in the same window
 are read-only: possible manual changes are reported, not overwritten.
 
 At the deadline, all background reads and retries stop. An already submitted HTTP
 request may finish; the controller starts no further request after expiry. A
 settled operation retains its last observed result. An unsettled one becomes
 `needs-attention`, with its recovery snapshot preserved. A restart resumes only
-the unused part of an existing window; it does not grant another ten minutes.
+the unused part of an existing window; it does not grant another three minutes.
 Stopping and restarting the timer cannot renew a window.
 
 Repeated presses while a window is open preserve its deadline and retry budget.

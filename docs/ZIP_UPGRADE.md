@@ -116,7 +116,7 @@ After successful verification, enable the reconciliation timer, restore the
 midnight timer if previously in use, and restart Homebridge if you stopped it.
 The midnight timer can immediately run a missed expiration when restarted.
 Re-enabling reconciliation resumes only a request still inside its original
-ten-minute window. Expired requests do not restart automatically. v1.0.1 journals
+three-minute window. Expired requests do not restart automatically. v1.0.1 journals
 without deadlines stop their old indefinite audits; incomplete journals need an
 explicit retry. No snapshot is discarded. The v1.0.1 systemd unit contents are
 unchanged, so an existing verified timer needs no replacement.

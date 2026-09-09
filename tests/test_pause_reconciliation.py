@@ -57,9 +57,6 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.snapshot()["reconciliation"]["samples"], 1)
         self.tick(1060)
         self.tick(1120)
-        self.assertEqual(self.snapshot()["reconciliation"]["phase"], "settling")
-        for when in (1180, 1240, 1300, 1360):
-            self.tick(when)
         self.assertEqual(self.snapshot()["reconciliation"]["phase"], "complete")
 
     def test_delayed_rollback_retries_only_mismatched_schedule_after_cooldown(self):
@@ -73,6 +70,8 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual([(s["uniqueId"], desired) for s, desired in writes.call_args.args[0]], [("1", False)])
             self.assertEqual(self.snapshot()["reconciliation"]["attempts"]["1"], 2)
 
+    # Exercise the later retry/audit path with an injected longer budget.
+    @mock.patch.object(fixtures.MODULE, "VERIFICATION_WINDOW_SECONDS", 600)
     def test_write_budget_is_durable_but_late_success_can_still_settle(self):
         self.start()
         with mock.patch.object(self.engine, "set_schedules_batch", return_value=[]) as writes:
@@ -85,6 +84,8 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(writes.call_count, 3)
             self.assertEqual(self.snapshot()["reconciliation"]["phase"], "complete")
 
+    # Exercise the later retry/audit path with an injected longer budget.
+    @mock.patch.object(fixtures.MODULE, "VERIFICATION_WINDOW_SECONDS", 600)
     def test_unpause_retains_snapshot_and_heals_visible_status_after_late_rollback(self):
         self.start(False)
         with mock.patch.object(self.engine, "set_schedules_batch", return_value=[]) as writes:
@@ -101,6 +102,8 @@ class ReconciliationTests(unittest.TestCase):
             self.assertTrue(self.engine.display_pause_state(self.engine.load_state()))
             writes.assert_not_called()  # a settled operation never overrides a manual edit
 
+    # Exercise the later retry/audit path with an injected longer budget.
+    @mock.patch.object(fixtures.MODULE, "VERIFICATION_WINDOW_SECONDS", 600)
     def test_settled_pause_throttles_observations_and_preserves_manual_changes(self):
         self.start()
         for when in (1000, 1060, 1120, 1180, 1240, 1300, 1360):
@@ -226,6 +229,8 @@ class ReconciliationTests(unittest.TestCase):
                 self.engine.maintain_pause()
             writes.assert_not_called()
 
+    # Exercise the later retry/audit path with an injected longer budget.
+    @mock.patch.object(fixtures.MODULE, "VERIFICATION_WINDOW_SECONDS", 600)
     def test_retained_settled_restore_does_not_block_upgrade_but_pending_restore_does(self):
         self.start(False)
         installer = installer_fixtures.MODULE
@@ -246,7 +251,7 @@ class ReconciliationTests(unittest.TestCase):
         for desired in (True, False):
             self.now = 1000
             self.start(desired)
-            self.now = 1600
+            self.now = 1180
             with mock.patch.object(self.engine, "discover_schedules") as reads, mock.patch.object(self.engine, "set_schedules_batch") as writes, mock.patch.object(self.engine, "handle_active_cleaning") as dock:
                 self.engine.maintain_pause()
                 saved = self.fixture.paths["STATE_FILE"].read_bytes()
@@ -261,9 +266,9 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_completed_window_closes_without_another_homebridge_read(self):
         self.start(False)
-        for when in range(1000, 1600, 60):
+        for when in range(1000, 1180, 60):
             self.tick(when, first=True)
-        self.now = 1600
+        self.now = 1180
         with mock.patch.object(self.engine, "api_request") as api:
             self.engine.maintain_pause()
             self.now = 100000
@@ -294,7 +299,7 @@ class ReconciliationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.engine.activate_pause()
         original = self.engine.load_state()["pendingActivationWindow"]
-        self.now = 1600
+        self.now = 1180
         with mock.patch.object(self.engine, "activate_pause") as resume:
             self.engine.maintain_pause()
             self.now = 2000
@@ -307,32 +312,32 @@ class ReconciliationTests(unittest.TestCase):
         with mock.patch.object(self.engine, "discover_schedules_with_recovery", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
                 self.engine.activate_pause()
-        self.assertEqual(self.engine.load_state()["pendingActivationWindow"]["endsAt"], 2600)
+        self.assertEqual(self.engine.load_state()["pendingActivationWindow"]["endsAt"], 2180)
 
     def test_resumed_initial_discovery_keeps_original_deadline(self):
         self.engine.persist_state(False, "initial")
         with mock.patch.object(self.engine, "discover_schedules_with_recovery", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
                 self.engine.activate_pause()
-        self.now = 1300
+        self.now = 1060
         with mock.patch.object(self.engine, "discover_schedules", return_value=[fixtures.schedule("1", False)]), mock.patch.object(self.engine, "handle_active_cleaning"):
             self.engine.maintain_pause()
-        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1600)
+        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1180)
 
     def test_restore_planning_does_not_renew_deadline_after_outage(self):
         self.start()
         with mock.patch.object(self.engine, "discover_schedules_with_recovery", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
                 self.engine.deactivate_pause()
-        self.now = 1300
+        self.now = 1060
         with mock.patch.object(self.engine, "set_schedules_batch", return_value=[]):
-            self.tick(1300)
-        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1600)
+            self.tick(1060)
+        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1180)
 
     def test_slow_discovery_crossing_deadline_cannot_start_retry_or_dock(self):
         self.start()
         def slow_read():
-            self.now = 1601
+            self.now = 1181
             return [fixtures.schedule("1", True), fixtures.schedule("2", False)]
         with mock.patch.object(self.engine, "discover_schedules", side_effect=slow_read), mock.patch.object(self.engine, "set_schedules_batch") as writes, mock.patch.object(self.engine, "handle_active_cleaning") as dock:
             with self.assertRaises(self.engine.VerificationWindowExpired):
@@ -342,7 +347,7 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_http_guard_blocks_requests_after_deadline(self):
         self.start()
-        self.now = 1600
+        self.now = 1180
         with mock.patch.object(self.engine.urllib.request, "urlopen") as network:
             for call in (lambda: self.engine.api_request("GET", "/api/accessories"),
                          lambda: self.engine.api_request_with_token("PUT", "/api/accessories/1", {}, "token", 30),
@@ -353,7 +358,7 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_explicit_retry_reopens_failed_restore_with_saved_targets(self):
         self.start(False)
-        self.now = 1600
+        self.now = 1180
         self.engine.maintain_pause()
         self.now = 2000
         with mock.patch.object(self.engine, "discover_schedules", return_value=[fixtures.schedule("1", False), fixtures.schedule("2", False)]), mock.patch.object(self.engine, "set_schedules_batch", return_value=[]) as writes:
@@ -361,16 +366,25 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(writes.call_args.args[0][0][1], True)
         operation = self.snapshot()["reconciliation"]
         self.assertEqual(operation["targets"], {"1": True})
-        self.assertEqual(operation["window"]["endsAt"], 2600)
+        self.assertEqual(operation["window"]["endsAt"], 2180)
 
-    def test_rollback_after_cache_interval_is_still_eligible_for_retry(self):
+    def test_matching_write_result_can_settle_before_five_minute_cache_expiry(self):
         self.start()
-        for when in (1000, 1060, 1120, 1180, 1240):
+        for when in (1000, 1060, 1120):
             self.tick(when)
-        with mock.patch.object(self.engine, "set_schedules_batch", return_value=[]) as writes:
-            self.tick(1300, first=True)
-            writes.assert_called_once()
-        self.assertEqual(self.snapshot()["reconciliation"]["phase"], "settling")
+        self.assertEqual(self.snapshot()["reconciliation"]["phase"], "complete")
+        self.assertLess(self.now - 1000, 300)
+        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1180)
+
+    def test_prior_development_window_is_capped_without_getting_a_new_budget(self):
+        snapshot = self.start()
+        snapshot["reconciliation"]["window"]["endsAt"] = 1600
+        self.engine.persist_active_snapshot(snapshot)
+        self.now = 1180
+        with mock.patch.object(self.engine, "api_request") as api:
+            self.engine.maintain_pause()
+            api.assert_not_called()
+        self.assertTrue(self.snapshot()["reconciliation"]["window"]["closed"])
 
     def test_clock_rollback_closes_window_instead_of_extending_it(self):
         self.start()
@@ -403,16 +417,16 @@ class ReconciliationTests(unittest.TestCase):
         with mock.patch.object(self.engine, "discover_schedules", return_value=[fixtures.schedule("1", False), fixtures.schedule("2", False)]):
             self.engine.activate_pause()
             self.engine.REQUEST_WINDOW = None  # fresh process has no in-memory budget
-            self.now = 1180
+            self.now = 1150
             self.engine.maintain_pause()
-        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1600)
+        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1180)
 
     def test_opposite_request_gets_its_own_deadline(self):
         self.start()
         self.now = 1540
         with mock.patch.object(self.engine, "discover_schedules", return_value=[fixtures.schedule("1", True), fixtures.schedule("2", False)]):
             self.engine.deactivate_pause()
-        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 2140)
+        self.assertEqual(self.snapshot()["reconciliation"]["window"]["endsAt"], 1720)
 
     def test_expired_activation_summary_is_consistent_for_individual_and_all(self):
         state = self.engine.load_state()
@@ -427,7 +441,7 @@ class ReconciliationTests(unittest.TestCase):
         with mock.patch.object(self.engine, "discover_schedules_with_recovery", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
                 self.engine.deactivate_pause()
-        self.now = 1600
+        self.now = 1180
         self.engine.maintain_pause()
         self.assertTrue(self.engine.load_state()["operation"]["planningRequired"])
         self.now = 2000

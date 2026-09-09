@@ -112,9 +112,10 @@ SCHEDULE_VERIFICATION_RETRY_DELAYS_SECONDS = (1, 2, 4, 8, 10)
 SETTLE_SECONDS = 120
 OBSERVATION_MIN_SECONDS = 30
 OBSERVATION_MAX_GAP_SECONDS = 150
-VERIFICATION_WINDOW_SECONDS = 600
-# Allow the default five-minute plugin cache to refresh before settlement.
-EARLIEST_SETTLEMENT_SECONDS = 360
+VERIFICATION_WINDOW_SECONDS = 180
+# Accept journals written by the earlier development build, but do not extend
+# their monitoring beyond the current request-window limit.
+MAX_SAVED_WINDOW_SECONDS = 600
 AUDIT_INTERVAL_SECONDS = 60
 REQUEST_WINDOW = None
 WRITE_RETRY_SECONDS = 120
@@ -164,7 +165,7 @@ def validate_window(window):
             or any(type(window.get(key)) not in (int, float)
                    or not math.isfinite(window[key]) or window[key] < 0
                    for key in ("startedAt", "endsAt"))
-            or not 0 <= window["endsAt"] - window["startedAt"] <= VERIFICATION_WINDOW_SECONDS):
+            or not 0 <= window["endsAt"] - window["startedAt"] <= MAX_SAVED_WINDOW_SECONDS):
         raise RuntimeError("Verification window is invalid")
 
 
@@ -172,7 +173,8 @@ def window_open(window):
     if window is None:  # Old journals never acquire a fresh budget on a timer tick.
         return False
     validate_window(window)
-    return not window["closed"] and window["startedAt"] <= time.time() < window["endsAt"]
+    deadline = min(window["endsAt"], window["startedAt"] + VERIFICATION_WINDOW_SECONDS)
+    return not window["closed"] and window["startedAt"] <= time.time() < deadline
 
 
 def require_request_window():
@@ -878,8 +880,7 @@ def observe_reconciliation(snapshot, live, *, retry=False):
         operation["samples"] += 1
         operation["lastObservationAt"] = now
     settled = (operation["samples"] >= 3
-               and now - operation["matchingSince"] >= SETTLE_SECONDS
-               and now - operation["window"]["startedAt"] >= EARLIEST_SETTLEMENT_SECONDS)
+               and now - operation["matchingSince"] >= SETTLE_SECONDS)
     operation["phase"] = "complete" if settled else "settling"
     if settled:
         operation["auditOnly"] = True
