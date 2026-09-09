@@ -21,6 +21,14 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertIn(prefix + "README.md", names)
             self.assertIn(prefix + "controller/vacuum-pause-controller.py", names)
             self.assertIn(prefix + "config/vacuums.example.json", names)
+            for relative in (
+                "systemd/roborock-pause-reconcile.service",
+                "systemd/roborock-pause-reconcile.timer",
+                "systemd/roborock-pause-until-tomorrow.service",
+                "systemd/roborock-pause-until-tomorrow.timer",
+                "docs/ZIP_UPGRADE.md",
+            ):
+                self.assertIn(prefix + relative, names)
             self.assertFalse(any("tests/" in name for name in names))
             self.assertFalse(any("__pycache__" in name for name in names))
             self.assertNotIn(prefix + "controller/vacuums.json", names)

@@ -1,7 +1,8 @@
 # Roborock Pause Schedules
 
 This project adds HomeKit switches that temporarily turn off your Roborock
-cleaning schedules and later restore them to exactly the state they were in.
+cleaning schedules and later restore the saved states owned by that pause,
+while preserving detected manual changes.
 It works with schedules exposed by `homebridge-roborock-matter` through the
 Homebridge API.
 
@@ -13,7 +14,9 @@ of the download methods below, then follow the fresh-install checklist.
 You need:
 
 - a Linux computer running Homebridge and `homebridge-roborock-matter`;
-- Python 3 and Bash;
+- Python 3 and Bash, plus `unzip` for ZIP installations;
+- systemd for the documented background reconciliation setup;
+- Script2 (or another command-switch plugin) for the HomeKit pause switches;
 - a dedicated Homebridge user account for this automation; and
 - the vacuum, schedule, cleaning, docked, and return-to-dock services visible
   in Homebridge.
@@ -22,39 +25,71 @@ The commands below assume the final installation folder is
 `/var/lib/homebridge/roborockPauseSchedules`. If you choose another folder, set
 `ROBOROCK_PAUSE_ROOT` to that absolute path before running the tools.
 
+The pause controller uses the existing Homebridge interface. It does not need
+a separate Roborock login or a pause-specific API in the vacuum plugin.
+Homebridge switch values provide **best-effort observations**, not guaranteed
+robot acknowledgement. Background reconciliation is part of the normal setup;
+the separate midnight-expiration timer is optional.
+
 ## 1. Download the project
 
 ### Option A: download a ZIP (simplest)
 
-1. Open the project's GitHub **Releases** page.
+1. Open the project's [GitHub Releases](https://github.com/pponce/roborockPauseSchedules/releases) page.
 2. Open the newest release and download the attached
    `roborockPauseSchedules-<version>.zip` file.
-3. Optionally compare the download with the attached `.sha256` file.
+3. Download the matching `.zip.sha256` file and verify the checksum.
 4. Extract the ZIP and move the extracted folder to the final installation
    path.
 
-Example:
+Example for v1.0.1, from the directory containing both downloads. Use the
+attached project ZIP, rather than GitHub's automatic **Source code (zip)**.
+These commands are for a **fresh installation**; the destination must not
+already exist:
 
 ```bash
-sudo mv roborockPauseSchedules-1.0.0 /var/lib/homebridge/roborockPauseSchedules
+sha256sum --check roborockPauseSchedules-1.0.1.zip.sha256 &&
+unzip roborockPauseSchedules-1.0.1.zip &&
+test ! -e /var/lib/homebridge/roborockPauseSchedules &&
+sudo mv roborockPauseSchedules-1.0.1 /var/lib/homebridge/roborockPauseSchedules &&
+sudo chown -R homebridge:homebridge /var/lib/homebridge/roborockPauseSchedules &&
 cd /var/lib/homebridge/roborockPauseSchedules
 ```
 
 ZIP installations run normally. The only limitation is that the guarded Git
-upgrade commands cannot update them; download and review a newer ZIP when you
-want to upgrade.
+upgrade commands cannot update them. Use the [ZIP upgrade guide](docs/ZIP_UPGRADE.md)
+to update program files while preserving your registry, credentials, and snapshots.
 
 ### Option B: clone with Git (easier future upgrades)
 
 ```bash
-sudo git clone https://github.com/pponce/roborockPauseSchedules.git \
-  /var/lib/homebridge/roborockPauseSchedules
+sudo -H -u homebridge git clone https://github.com/pponce/roborockPauseSchedules.git \
+  /var/lib/homebridge/roborockPauseSchedules &&
 cd /var/lib/homebridge/roborockPauseSchedules
 ```
 
 No fork is required. A clone has Git history, so it can later use
 `upgrade-plan` and `upgrade-apply` as described in
 [the upgrade guide](docs/MANAGED_UPGRADE.md).
+
+### Run setup as the runtime owner
+
+The examples assume the Linux service account and group are both `homebridge`.
+Run the remaining Python and project-script commands as that account, for
+example in a shell opened with:
+
+```bash
+sudo -H -u homebridge bash
+cd /var/lib/homebridge/roborockPauseSchedules
+```
+
+Use your regular sudo-capable login for commands beginning with `sudo`, such as
+installing systemd files. Adjust the account and registry settings if Homebridge
+runs under another user. Do not change an existing checkout's ownership or add
+a global Git `safe.directory` exception to fix a command run as the wrong user.
+
+A separate development checkout does not update the running installation.
+Script2 commands and systemd `WorkingDirectory` must point to the **live root**.
 
 ## 2. Fresh install, step by step
 
@@ -107,6 +142,22 @@ python3 install-roborock-pause.py verify --live
 registry, an inactive state file for each vacuum, and a tamper-evident manifest.
 It does not edit Homebridge, contact Roborock with a write, or run `systemctl`.
 
+For a fresh installation, migrate the new version-1 manifest to version 2 while
+all pauses are still inactive. This enables the later add/remove-vacuum and
+managed Git-upgrade workflows. Reuse the reviewed stage from Step 3:
+
+```bash
+python3 install-roborock-pause.py migrate-plan --stage /tmp/roborock-pause-stage
+python3 install-roborock-pause.py migrate-apply \
+  --stage /tmp/roborock-pause-stage --dry-run
+python3 install-roborock-pause.py migrate-apply \
+  --stage /tmp/roborock-pause-stage --yes
+python3 install-roborock-pause.py verify
+```
+
+For an existing version-2 manifest, skip this migration. It is an administrative
+step; it does not install timers or operate a vacuum.
+
 ### Step 5: add the HomeKit switches
 
 The staged `command-switches.json` file contains the exact commands for your
@@ -128,7 +179,23 @@ You may also add these project-wide switches:
 Keep existing HomeKit accessory names and identifiers when changing commands,
 otherwise HomeKit may treat them as new accessories.
 
-### Step 6: test without changing a schedule
+Use absolute paths in Script2. For example, the Pause All ON command is
+`bash /var/lib/homebridge/roborockPauseSchedules/all-vacuums-pause-on.sh`.
+Use the matching OFF and STATE scripts in the same directory. These aggregate
+wrappers return promptly; direct per-vacuum Python commands wait for the initial
+attempt. Neither successful exit nor an immediate switch change proves that
+Roborock has completed the schedule operation.
+
+### Step 6: enable background reconciliation
+
+Complete [Background reconciliation timer](#background-reconciliation-timer)
+below before using the pause switches. Both ZIP and Git installations need this
+step. The installer and ZIP supply the files but do not enable the timer.
+
+The midnight timer has a different purpose and is configured separately under
+[Optional automatic expiration timer](#optional-automatic-expiration-timer).
+
+### Step 7: test without changing a schedule
 
 Replace `VACUUM_ID` with an ID from `controller/vacuums.json`:
 
@@ -143,6 +210,16 @@ Only use the HomeKit ON/OFF switches for a real test when you are ready for the
 controller to change schedules. The controller saves the original schedule
 states before writing and keeps its recovery snapshot if verification fails.
 
+After an intentional pause or restore, inspect progress with:
+
+```bash
+python3 controller/all-vacuums-pause-controller.py status
+```
+
+`planning` or `settling` means work remains; `complete` means the exposed values
+passed the observation window; `needs-attention` means a disagreement or error
+needs investigation. `complete` is still best-effort, not cloud-authoritative proof.
+
 ## Everyday use
 
 - Turn a vacuum's switch **on** to save its schedule states and turn all of its
@@ -154,7 +231,9 @@ states before writing and keeps its recovery snapshot if verification fails.
 
 ## Add a vacuum
 
-Do not edit the live registry directly.
+Do not edit the live registry directly. These commands require a version-2
+manifest; older installations should first follow the
+[manifest migration guide](docs/MANIFEST_V2_MIGRATION.md).
 
 1. Make sure all existing pause switches are off.
 2. Run read-only discovery and save a new complete proposal:
@@ -207,6 +286,97 @@ Removal archives the vacuum's state and recovery files instead of silently
 deleting them. Full safety and rollback details are in
 [the reconfiguration guide](docs/RECONFIGURE.md).
 
+## Background reconciliation timer
+
+Two independent timers serve different purposes:
+
+| Timer | Purpose | When it runs |
+|---|---|---|
+| `roborock-pause-reconcile.timer` | Rechecks pending pause/restore operations and retries mismatched schedules within their budget. | 60 seconds after boot and 60 seconds after the previous service run finishes. |
+| `roborock-pause-until-tomorrow.timer` | Requests restoration of active pauses when Pause Until Tomorrow is ON. | Optional; 00:05 local time by default. |
+
+Keep reconciliation enabled even if you disable Pause Until Tomorrow. A timer
+invocation checks pending work approximately every minute; completed operations
+are polled no more often than about every five minutes. With no pause history
+requiring monitoring, a run can finish without a Homebridge request.
+
+### Render and review reconciliation units
+
+From the live installation, as its owner:
+
+```bash
+cd /var/lib/homebridge/roborockPauseSchedules
+reconcile_directory="$(mktemp -d /tmp/roborock-reconcile.XXXXXX)"
+python3 render-systemd-units.py --output "$reconcile_directory"
+cat "$reconcile_directory/roborock-pause-reconcile.service"
+cat "$reconcile_directory/roborock-pause-reconcile.timer"
+printf 'Prepared files: %s\n' "$reconcile_directory"
+```
+
+The renderer reads `controller/vacuums.json` and produces all four unit files.
+Check that the reconciliation service's `User`, `Group`, and `WorkingDirectory`
+match the live installation. Its command is
+`python3 controller/all-vacuums-pause-controller.py maintain`.
+
+### Install and enable reconciliation
+
+Return to your regular sudo-capable shell. Set `reconcile_directory` to the
+exact prepared directory printed above; `/tmp/roborock-reconcile.XXXXXX` below
+is a placeholder, not a literal directory to use. Stop if rendering or review
+failed. If units are already installed, compare and back them up before replacing
+them; installers that track their hashes also need a reviewed manifest update.
+
+```bash
+reconcile_directory=/tmp/roborock-reconcile.XXXXXX
+sudo systemd-analyze verify \
+  "$reconcile_directory/roborock-pause-reconcile.service" \
+  "$reconcile_directory/roborock-pause-reconcile.timer" &&
+sudo install -o root -g root -m 0644 \
+  "$reconcile_directory/roborock-pause-reconcile.service" \
+  "$reconcile_directory/roborock-pause-reconcile.timer" \
+  /etc/systemd/system/ &&
+sudo systemctl daemon-reload &&
+sudo systemctl enable --now roborock-pause-reconcile.timer
+```
+
+Enable the `.timer`, not the oneshot `.service`. No Homebridge restart is needed.
+Enabling it after the machine has been up for more than 60 seconds can trigger
+the first run immediately. That run can retry an already pending schedule write
+or submit its still-pending docking action; enabling it is not a read-only test.
+
+### Verify and troubleshoot
+
+```bash
+systemctl is-enabled roborock-pause-reconcile.timer
+systemctl is-active roborock-pause-reconcile.timer
+systemctl list-timers --all roborock-pause-reconcile.timer
+systemctl show roborock-pause-reconcile.service \
+  -p Result -p ExecMainStatus -p ActiveState -p SubState
+sudo journalctl -u roborock-pause-reconcile.service --since today --no-pager
+```
+
+A successful oneshot service normally returns to `inactive (dead)` between runs;
+the **timer** should remain active. `NEXT` can briefly show `-` while the service
+is running. If it stays unset, inspect the service result and journal for a stuck
+operation, configuration error, or Homebridge connectivity problem. Systemd logs
+cover maintenance; immediate Pause All workers also log to
+`controller/all-vacuums-pause-operation.log`. Review logs before sharing them.
+
+To run one cycle immediately, use `sudo systemctl start roborock-pause-reconcile.service`.
+It may perform pending writes. For a read-only local summary instead, run the
+controller's `status` command as the runtime owner.
+
+To suspend checks, run `sudo systemctl stop roborock-pause-reconcile.timer`.
+This does not cancel a service run already in progress. To keep checks disabled
+across reboots, use `sudo systemctl disable --now roborock-pause-reconcile.timer`.
+Neither command restores schedules. Finish pending work before an upgrade and
+restart the timer afterward. See [upgrade guidance](docs/UPGRADE.md).
+
+Systemd is the provided scheduler, not part of the reconciliation algorithm.
+Another scheduler can invoke `maintain` as the runtime owner from the live root,
+but must handle reboot startup and avoid accumulating overlapping invocations.
+Do not run two independent reconciliation schedulers.
+
 ## Optional automatic expiration timer
 
 The optional systemd timer automatically restores paused schedules shortly
@@ -218,9 +388,9 @@ The timer works together with the pause switches as follows:
 | Action or switch | Effect |
 |---|---|
 | Turn an individual vacuum's pause switch ON | Saves that vacuum's current schedule states and pauses its schedules. |
-| Turn an individual vacuum's pause switch OFF | Immediately restores only that vacuum's saved schedule states. |
+| Turn an individual vacuum's pause switch OFF | Requests restoration of the saved states owned by that pause; reconciliation checks completion. |
 | Turn Pause All ON | Pauses every configured vacuum. |
-| Turn Pause All OFF | Immediately restores every active pause, including pauses started with an individual switch. |
+| Turn Pause All OFF | Requests restoration of every active pause, including pauses started with an individual switch. |
 | Leave Pause Until Tomorrow ON | Allows the systemd timer to restore all active pauses when the timer runs. |
 | Turn Pause Until Tomorrow OFF | The timer still runs, but exits without changing any pause. Pauses remain active until manually restored. |
 
@@ -230,8 +400,9 @@ and turning it OFF does not immediately restore one. The preference remains
 ON after an automatic restoration, so future pauses will also expire after
 midnight unless you turn the switch OFF.
 
-The Pause All state is ON whenever at least one configured vacuum has an active
-pause. When automatic expiration runs, it performs the same aggregate restore
+The Pause All state is ON whenever at least one configured vacuum's pause display
+is ON, including optimistic requests still settling. When automatic expiration
+runs, it performs the same aggregate restore
 operation as turning Pause All OFF.
 
 ### Render and review the units
@@ -272,7 +443,8 @@ should remain active or turn Pause Until Tomorrow OFF.
 
 ### Install and enable the timer
 
-After reviewing both rendered files, install them as root:
+After reviewing both rendered files, install them from your sudo-capable login.
+If you changed shells, set `render_directory` to the prepared path first:
 
 ```bash
 sudo install -o root -g root -m 0644 \
@@ -330,11 +502,12 @@ nothing.
 |---|---|
 | `discover-vacuum-config.py` | Finds compatible Homebridge services without changing them. |
 | `install-roborock-pause.py` | Safely stages, installs, checks, reconfigures, upgrades, or uninstalls local configuration. Run it with `--help` to see every command. |
-| `controller/vacuum-pause-controller.py` | Runs `init`, `state`, `on`, `off`, `reconcile`, or emergency `abandon` for one vacuum ID. |
+| `controller/vacuum-pause-controller.py` | Runs `init`, `state`, `on`, `off`, `maintain`, `reconcile`, or emergency `abandon` for one vacuum ID. |
+| `controller/all-vacuums-pause-controller.py` | Coordinates Pause All and provides the local `status` summary and periodic `maintain` command. |
 | `all-vacuums-pause-*.sh` | Runs ON, OFF, STATE, or expiration for every configured vacuum. |
 | `pause-until-tomorrow-*.sh` | Enables, disables, or reads the automatic-expiration preference. |
 | `setup-homebridge-auto-auth.sh` | Securely creates the local Homebridge login and token files. |
-| `render-systemd-units.py` | Makes optional timer files for review; it does not install or enable them. |
+| `render-systemd-units.py` | Renders both reconciliation and optional midnight timer/service pairs; it does not install or enable them. |
 | `config/vacuums.example.json` | Example only; your real registry is `controller/vacuums.json`. |
 | `controller/` | The main program plus private local state, registry, and recovery files. |
 | `systemd/` | Default timer and service examples. |
@@ -422,17 +595,35 @@ python3 controller/vacuum-pause-controller.py VACUUM_ID abandon \
   --confirm I-WILL-RESTORE-SCHEDULES-MANUALLY
 ```
 
-To remove installer-owned configuration while preserving vacuum state files:
+Before uninstalling, restore schedules and resolve pending operations while the
+controller and reconciliation timer are still available. Then disable both timers
+from your sudo-capable login and allow any running services to finish:
+
+```bash
+sudo systemctl disable --now roborock-pause-reconcile.timer
+sudo systemctl disable --now roborock-pause-until-tomorrow.timer
+```
+
+Skip the second command if the optional midnight timer was never installed.
+Remove the Script2 switches to prevent further requests. As the runtime owner,
+review removal of installer-owned configuration while preserving vacuum state files:
 
 ```bash
 python3 install-roborock-pause.py uninstall --dry-run
 python3 install-roborock-pause.py uninstall --yes
 ```
 
+Manually installed systemd units may not be installer-owned and can remain on disk.
+After reviewing the uninstall plan, remove any remaining project unit files from
+`/etc/systemd/system` and run `sudo systemctl daemon-reload`. Do not leave an enabled
+timer pointing at removed configuration. Keep private recovery backups until you
+have confirmed the desired schedules independently.
+
 ## More detailed documentation
 
 - [Managed reconfiguration](docs/RECONFIGURE.md)
 - [Git-based upgrades](docs/MANAGED_UPGRADE.md)
+- [ZIP and separate-runtime upgrades](docs/ZIP_UPGRADE.md)
 - [Upgrade safety notes](docs/UPGRADE.md)
 - [Older manifest migration](docs/MANIFEST_V2_MIGRATION.md)
 - [Release checklist](docs/RELEASE_CHECKLIST.md)

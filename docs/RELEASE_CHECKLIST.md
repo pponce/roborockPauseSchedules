@@ -29,6 +29,10 @@
 - [ ] The release ZIP and its SHA-256 checksum build and verify successfully.
 - [ ] `config/vacuums.example.json` contains no deployment secrets.
 - [ ] Rendered systemd units match committed packaged units.
+- [ ] Both timer/service pairs are in the ZIP; README explains enabling
+      reconciliation separately from optional midnight expiration.
+- [ ] ZIP upgrade instructions preserve private runtime files and do not
+      require Git metadata or developer tests in the runtime archive.
 - [ ] Installer and renderer documentation states that neither invokes
       `systemctl` or edits Homebridge configuration.
 - [ ] Release notes distinguish deterministic tests, read-only live checks,
@@ -40,8 +44,13 @@
 - [ ] The external registry, manifest, runtime state, credentials, and recovery
       artifacts are backed up with modes and hashes.
 - [ ] The current production commit and rollback commit are recorded.
-- [ ] The upgrade is reviewed as a fast-forward before source files change.
-- [ ] Post-upgrade deterministic tests and `verify --live` pass.
+- [ ] A live Git upgrade is reviewed as a fast-forward; a ZIP/separate-runtime
+      deployment has a reviewed file set and private rollback backup.
+- [ ] Timers are stopped after pending work finishes; no service or detached
+      controller worker is active during file deployment.
+- [ ] Post-upgrade local verification passes; deterministic tests pass in the
+      source checkout. Any `verify --live` check is reported as Homebridge
+      observation, not proof of robot command completion.
 - [ ] State wrappers, systemd timer status, ownership, modes, and protected
       artifact hashes are unchanged unless the release explicitly requires a
       reviewed migration.
