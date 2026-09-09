@@ -13,7 +13,7 @@ def main():
     if len(sys.argv) < 3:
         print(
             "Usage: vacuum-pause-controller.py VACUUM_ID "
-            "on|off|state|reconcile|abandon|init "
+            "on|off|state|reconcile|maintain|abandon|init "
             "[--dry-run|--confirm PHRASE]",
             file=sys.stderr,
         )
@@ -37,7 +37,7 @@ def main():
         try:
             engine.configure(config)
             state = engine.load_state()
-            print("true" if state["pauseActive"] else "false")
+            print("true" if engine.display_pause_state(state) else "false")
             return 0
         except (OSError, ValueError, RuntimeError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

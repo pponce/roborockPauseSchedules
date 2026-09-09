@@ -1,0 +1,10 @@
+[Unit]
+Description=Recheck Roborock pause operations every minute
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=60
+Unit=roborock-pause-reconcile.service
+
+[Install]
+WantedBy=timers.target

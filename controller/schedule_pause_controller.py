@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import math
 import os
 import sys
 import fcntl
@@ -106,6 +107,13 @@ def configure(config):
 API_READ_TIMEOUT_SECONDS = 15
 SCHEDULE_WRITE_TIMEOUT_SECONDS = 30
 SCHEDULE_VERIFICATION_RETRY_DELAYS_SECONDS = (1, 2, 4, 8, 10)
+# These bounds describe observed Homebridge state, never robot confirmation.
+SETTLE_SECONDS = 120
+OBSERVATION_MIN_SECONDS = 30
+OBSERVATION_MAX_GAP_SECONDS = 150
+AUDIT_INTERVAL_SECONDS = 300
+WRITE_RETRY_SECONDS = 120
+MAX_WRITE_ATTEMPTS = 3
 SUPPORTED_SNAPSHOT_VERSIONS = (1, 2, 3)
 TOKEN_REFRESH_LOCK = Lock()
 
@@ -113,6 +121,7 @@ VACUUM_ACTION_RESULTS = {
     "pending-schedule-disable",
     "return-to-dock-requested",
     "return-to-dock-acknowledged",
+    "return-to-dock-submitted",
     "not-required-idle-docked",
     "not-required-not-cleaning",
     "transition-confirmed",
@@ -144,6 +153,18 @@ def load_state():
         raise RuntimeError("Pause state pauseActive is invalid")
     if not isinstance(state.get("sessionId"), str) or not state["sessionId"]:
         raise RuntimeError("Pause state sessionId is invalid")
+    if "pendingActivation" in state and not isinstance(state["pendingActivation"], bool):
+        raise RuntimeError("Pause pendingActivation is invalid")
+    operation = state.get("operation")
+    if "operation" in state and (
+        not isinstance(operation, dict)
+        or not isinstance(operation.get("operationId"), str)
+        or not operation["operationId"]
+        or not isinstance(operation.get("desiredPause"), bool)
+        or not isinstance(operation.get("displayPause"), bool)
+        or operation.get("phase") not in ("planning", "settling", "complete", "needs-attention")
+    ):
+        raise RuntimeError("Pause operation summary is invalid")
     return state
 
 
@@ -203,6 +224,8 @@ def validate_snapshot(snapshot, expected_session):
         ):
             if field in vacuum_action and not isinstance(vacuum_action[field], str):
                 raise RuntimeError(f"Snapshot vacuumAction {field} is invalid")
+    if "reconciliation" in snapshot:
+        validate_reconciliation(snapshot)
     return snapshot
 
 
@@ -574,11 +597,11 @@ def handle_active_cleaning(snapshot):
 
     update_vacuum_action(
         snapshot,
-        "return-to-dock-acknowledged",
+        "return-to-dock-submitted",
         acknowledgedAt=utc_now(),
         **observed,
     )
-    print("Return to Dock: command acknowledged; arrival is not monitored.")
+    print("Return to Dock: submitted through Homebridge; robot acknowledgement and arrival are not verified.")
 
 
 def write_json_atomic(path, data):
@@ -650,6 +673,201 @@ def persist_state(active, sid):
     write_json_atomic(STATE_FILE, state)
 
     print(f"Pause state persisted: {'ACTIVE' if active else 'INACTIVE'}")
+
+
+def validate_reconciliation(snapshot):
+    operation = snapshot["reconciliation"]
+    ids = {item["uniqueId"] for item in snapshot["schedules"]}
+    if not isinstance(operation, dict) or operation.get("version") != 1:
+        raise RuntimeError("Reconciliation schema is invalid")
+    if not isinstance(operation.get("operationId"), str) or not operation["operationId"]:
+        raise RuntimeError("Reconciliation operation ID is invalid")
+    for key in ("desiredPause", "auditOnly", "supersededPendingPause"):
+        if not isinstance(operation.get(key), bool):
+            raise RuntimeError(f"Reconciliation {key} is invalid")
+    if operation.get("phase") not in ("planning", "settling", "complete", "needs-attention"):
+        raise RuntimeError("Reconciliation phase is invalid")
+    targets = operation.get("targets")
+    attempts = operation.get("attempts")
+    if (not isinstance(targets, dict) or not set(targets) <= ids
+            or any(not isinstance(value, bool) for value in targets.values())
+            or not isinstance(attempts, dict) or set(attempts) != set(targets)
+            or any(type(value) is not int or not 0 <= value <= MAX_WRITE_ATTEMPTS
+                   for value in attempts.values())):
+        raise RuntimeError("Reconciliation targets or attempt counts are invalid")
+    for key in ("nextRetryAt", "matchingSince", "lastObservationAt"):
+        value = operation.get(key)
+        if key == "nextRetryAt" and value is None:
+            raise RuntimeError("Reconciliation nextRetryAt is invalid")
+        if value is not None and (type(value) not in (float, int)
+                                  or not math.isfinite(value) or value < 0):
+            raise RuntimeError(f"Reconciliation {key} is invalid")
+    if type(operation.get("samples")) is not int or operation["samples"] < 0:
+        raise RuntimeError("Reconciliation sample count is invalid")
+
+
+def save_reconciliation(snapshot):
+    """Persist the journal before publishing its small UI/status summary."""
+    operation = snapshot["reconciliation"]
+    state = load_state()
+    if state["sessionId"] != snapshot["sessionId"]:
+        raise RuntimeError("Reconciliation session was superseded")
+    persist_active_snapshot(snapshot)
+    if operation["phase"] == "complete" and not operation["desiredPause"]:
+        state["pauseActive"] = False
+    display = operation["desiredPause"]
+    if operation["phase"] == "needs-attention":
+        display = operation.get("observedPause", state["pauseActive"])
+    state["operation"] = {
+        "operationId": operation["operationId"],
+        "desiredPause": operation["desiredPause"],
+        "phase": operation["phase"],
+        "displayPause": display,
+        "lastError": operation.get("lastError"),
+        "updatedAt": utc_now(),
+    }
+    write_json_atomic(STATE_FILE, state)
+
+
+def begin_reconciliation(snapshot, desired, targets, *, planning=False, superseded=False, audit_only=False):
+    if snapshot["version"] < 3:
+        snapshot["version"] = 3
+        snapshot["vacuumAction"] = {"result": "pending-schedule-disable", "updatedAt": utc_now()}
+    snapshot["reconciliation"] = {
+        "version": 1,
+        "operationId": session_id(),
+        "desiredPause": desired,
+        "phase": "planning" if planning else "settling",
+        "targets": dict(targets),
+        "attempts": {key: 0 for key in targets},
+        "nextRetryAt": 0,
+        "matchingSince": None,
+        "lastObservationAt": None,
+        "samples": 0,
+        "auditOnly": audit_only,
+        "supersededPendingPause": superseded,
+    }
+    save_reconciliation(snapshot)
+
+
+def record_reconciliation_attempt(snapshot, changes):
+    operation = snapshot["reconciliation"]
+    for schedule, _ in changes:
+        operation["attempts"][schedule["uniqueId"]] += 1
+    operation["nextRetryAt"] = time.time() + WRITE_RETRY_SECONDS
+    operation["matchingSince"] = None
+    operation["samples"] = 0
+    # A crash after this save consumes an attempt, rather than blindly replaying.
+    save_reconciliation(snapshot)
+
+
+def observe_reconciliation(snapshot, live, *, retry=False):
+    operation = snapshot["reconciliation"]
+    now = time.time()
+    live_by_id = {item["uniqueId"]: item for item in live}
+    saved_by_id = {item["uniqueId"]: item for item in snapshot["schedules"]}
+    if len(live_by_id) != len(live) or set(live_by_id) != set(saved_by_id):
+        raise RuntimeError("Schedule membership changed; automatic writes are suspended")
+    operation["observedPause"] = all(not item["on"] for item in live)
+    mismatches = [
+        (saved_by_id[key], desired)
+        for key, desired in operation["targets"].items()
+        if live_by_id[key]["on"] != desired
+    ]
+    previous_at = operation["lastObservationAt"]
+    max_gap = AUDIT_INTERVAL_SECONDS + OBSERVATION_MAX_GAP_SECONDS if operation["auditOnly"] else OBSERVATION_MAX_GAP_SECONDS
+    if previous_at is not None and (now < previous_at or now - previous_at > max_gap):
+        operation["matchingSince"] = None
+        operation["samples"] = 0
+    operation["lastError"] = None
+    if mismatches:
+        operation["matchingSince"] = None
+        operation["samples"] = 0
+        operation["phase"] = "needs-attention" if operation["auditOnly"] else "settling"
+        eligible = [item for item in mismatches
+                    if operation["attempts"][item[0]["uniqueId"]] < MAX_WRITE_ATTEMPTS]
+        if not eligible:
+            operation["phase"] = "needs-attention"
+        operation["lastObservationAt"] = now
+        save_reconciliation(snapshot)
+        if retry and not operation["auditOnly"] and eligible and now >= operation["nextRetryAt"]:
+            record_reconciliation_attempt(snapshot, eligible)
+            failures = set_schedules_batch(eligible)
+            if failures:
+                operation["lastError"] = "Schedule write failed; result remains uncertain"
+                save_reconciliation(snapshot)
+        return False
+    if operation["matchingSince"] is None:
+        operation["matchingSince"] = now
+        operation["samples"] = 1
+        operation["lastObservationAt"] = now
+    elif previous_at is None or now - previous_at >= OBSERVATION_MIN_SECONDS:
+        operation["samples"] += 1
+        operation["lastObservationAt"] = now
+    settled = (operation["samples"] >= 3
+               and now - operation["matchingSince"] >= SETTLE_SECONDS)
+    operation["phase"] = "complete" if settled else "settling"
+    if settled:
+        operation["auditOnly"] = True
+        if operation["desiredPause"]:
+            for saved in snapshot["schedules"]:
+                saved["pauseEstablishedOn"] = live_by_id[saved["uniqueId"]]["on"]
+    save_reconciliation(snapshot)
+    return settled
+
+
+def maintain_pause():
+    """One bounded observation/retry cycle, under the existing per-vacuum lock."""
+    state = load_state()
+    if state.get("pendingActivation") is True:
+        return activate_pause()
+    if "operation" not in state and not state["pauseActive"]:
+        return 0
+    snapshot = load_active_snapshot(state)
+    if "reconciliation" not in snapshot:
+        # Completed legacy pauses are observation-only. A recorded incomplete
+        # activation can resume, including a crash before its first write.
+        pending = snapshot.get("vacuumAction", {}).get("result") == "pending-schedule-disable"
+        begin_reconciliation(snapshot, True,
+                             {item["uniqueId"]: False for item in snapshot["schedules"]},
+                             audit_only=not pending)
+    operation = snapshot["reconciliation"]
+    if operation["phase"] == "planning":
+        return deactivate_pause()
+    last_at = operation["lastObservationAt"]
+    if (operation["auditOnly"] and last_at is not None
+            and 0 <= time.time() - last_at < AUDIT_INTERVAL_SECONDS):
+        save_reconciliation(snapshot)
+        return 0
+    try:
+        live = discover_schedules()
+        observe_reconciliation(snapshot, live, retry=True)
+        if (not operation["auditOnly"] and operation["desiredPause"] and all(not item["on"] for item in live)
+                and snapshot.get("vacuumAction", {}).get("result") == "pending-schedule-disable"):
+            # Persist intent before invoking the action. Do not replay an
+            # ambiguous docking command after a crash or HTTP timeout.
+            update_vacuum_action(snapshot, "return-to-dock-requested")
+            handle_active_cleaning(snapshot)
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+        operation["phase"] = "needs-attention"
+        operation["matchingSince"] = None
+        operation["samples"] = 0
+        operation["lastError"] = f"Observation/action unavailable ({type(exc).__name__})"
+        save_reconciliation(snapshot)
+        raise
+    print(f"{VACUUM_DISPLAY_NAME}: {operation['phase']} (Homebridge observations only)")
+    return 0
+
+
+def display_pause_state(state):
+    if state.get("pendingActivation") is True:
+        return True
+    operation = state.get("operation")
+    if operation is None:
+        return state["pauseActive"]
+    if not isinstance(operation, dict) or not isinstance(operation.get("displayPause"), bool):
+        raise RuntimeError("Pause operation display state is invalid")
+    return operation["displayPause"]
 
 
 def set_schedule(schedule, desired):
@@ -788,6 +1006,12 @@ def activate_pause():
         state = load_state()
         if state["pauseActive"]:
             snapshot = load_active_snapshot(state)
+            if "reconciliation" in snapshot:
+                if not snapshot["reconciliation"]["desiredPause"]:
+                    begin_reconciliation(snapshot, True, {
+                        item["uniqueId"]: False for item in snapshot["schedules"]
+                    })
+                return maintain_pause()
             successful_actions = {
                 "return-to-dock-acknowledged",
                 "not-required-idle-docked",
@@ -809,6 +1033,13 @@ def activate_pause():
             )
             return reconcile_active_pause()
 
+    # Initial discovery may fail before a snapshot exists. Persist the request
+    # so the timer can resume it; no schedule write is allowed before snapshot.
+    if not os.path.exists(STATE_FILE):
+        persist_state(False, session_id())
+    state = load_state()
+    state["pendingActivation"] = True
+    write_json_atomic(STATE_FILE, state)
     schedules = discover_schedules_with_recovery("Pause activation discovery")
 
     if not schedules:
@@ -851,6 +1082,9 @@ def activate_pause():
     print("Persisting pause state as ACTIVE...")
     persist_state(True, sid)
     persist_active_snapshot(snapshot)
+    begin_reconciliation(snapshot, True, {
+        item["uniqueId"]: False for item in snapshot_schedules
+    })
 
     print()
     print(f"===== TURNING {VACUUM_DISPLAY_NAME.upper()} SCHEDULES OFF =====")
@@ -868,6 +1102,7 @@ def activate_pause():
 
     if changes:
         print(f"Submitting {len(changes)} schedule writes as one coordinated batch...")
+        record_reconciliation_attempt(snapshot, changes)
         failures.extend(set_schedules_batch(changes))
 
     snapshot["pauseEstablishedAt"] = utc_now()
@@ -893,6 +1128,7 @@ def activate_pause():
             saved["pauseEstablishedOn"] = bool(live["on"])
         snapshot["pauseEstablishedAt"] = utc_now()
         persist_active_snapshot(snapshot)
+        observe_reconciliation(snapshot, final_schedules)
 
     except Exception as e:
         failures.append(f"Final verification failed: {e}")
@@ -918,6 +1154,7 @@ def activate_pause():
         return 1
 
     try:
+        update_vacuum_action(snapshot, "return-to-dock-requested")
         handle_active_cleaning(snapshot)
     except Exception as e:
         print()
@@ -929,9 +1166,9 @@ def activate_pause():
         return 1
 
     print()
-    print("RESULT: PASS")
+    print("RESULT: ACCEPTED; background settlement checks are pending.")
     print()
-    print(f"All {len(schedules)} {VACUUM_DISPLAY_NAME} schedules are OFF.")
+    print(f"Homebridge currently displays all {len(schedules)} schedules OFF.")
     print("Pause state is ACTIVE.")
     print(f"Session: {sid}")
     print()
@@ -948,12 +1185,29 @@ def deactivate_pause(dry_run=False):
         raise RuntimeError("Pause state file does not exist")
 
     state = load_state()
+    if state.get("pendingActivation") is True:
+        if not dry_run:
+            state.pop("pendingActivation")
+            write_json_atomic(STATE_FILE, state)
+        print("Pending activation cancelled before any schedule writes.")
+        return 0
 
+    if (not dry_run and state.get("operation", {}).get("desiredPause") is False
+            and state["operation"].get("phase") != "planning"):
+        return maintain_pause()
     if not state.get("pauseActive"):
         raise RuntimeError(f"{VACUUM_DISPLAY_NAME} pause is not currently active")
 
     snapshot = load_active_snapshot(state)
     snapshot_schedules = snapshot["schedules"]
+    previous_operation = snapshot.get("reconciliation", {})
+    pending_pause = (previous_operation.get("desiredPause") is True
+                     and not previous_operation.get("auditOnly", False))
+    pending_pause = pending_pause or previous_operation.get("supersededPendingPause", False)
+    if not dry_run and previous_operation.get("phase") != "planning":
+        # Record OFF before discovery so an outage at midnight cannot allow
+        # the maintenance timer to continue retrying the superseded ON.
+        begin_reconciliation(snapshot, False, {}, planning=True, superseded=pending_pause)
 
     live_schedules = discover_schedules_with_recovery("Unpause discovery")
 
@@ -978,7 +1232,9 @@ def deactivate_pause(dry_run=False):
 
         current_on = bool(live["on"])
 
-        if current_on != pause_established_on:
+        if pending_pause:
+            action = "RESTORE ON" if snapshot_on else "RESTORE OFF"
+        elif current_on != pause_established_on:
             action = "KEEP CURRENT"
         elif current_on != snapshot_on:
             action = "RESTORE ON" if snapshot_on else "RESTORE OFF"
@@ -1031,11 +1287,19 @@ def deactivate_pause(dry_run=False):
         for action in actions
         if action["action"].startswith("RESTORE ")
     ]
+    begin_reconciliation(snapshot, False, {
+        schedule["uniqueId"]: desired for schedule, desired in changes
+    }, superseded=pending_pause)
+    changes = [(schedule, desired) for schedule, desired in changes
+               if live_by_id[schedule["uniqueId"]]["on"] != desired]
     for schedule, desired in changes:
         print(f"{schedule['serviceName']}: restoring {'ON' if desired else 'OFF'}")
 
+    if changes:
+        record_reconciliation_attempt(snapshot, changes)
     failures = set_schedules_batch(changes)
-    _, verification_failures = verify_schedule_changes(changes)
+    final_schedules, verification_failures = verify_schedule_changes(changes)
+    observe_reconciliation(snapshot, final_schedules)
     failures.extend(verification_failures)
 
     if failures:
@@ -1051,15 +1315,9 @@ def deactivate_pause(dry_run=False):
 
         return 1
 
-    persist_state(False, state["sessionId"])
-    try:
-        os.unlink(SNAPSHOT_FILE)
-    except FileNotFoundError:
-        pass
-
     print()
-    print("RESULT: PASS")
-    print(f"{VACUUM_DISPLAY_NAME} pause is now INACTIVE.")
+    print("RESULT: ACCEPTED; restoration is awaiting background settlement checks.")
+    print("The snapshot is retained for recovery and later read-only checks.")
     print(f"===== END {VACUUM_DISPLAY_NAME.upper()} PAUSE DEACTIVATE =====")
 
     return 0
@@ -1071,6 +1329,8 @@ def reconcile_active_pause():
     print()
 
     state = load_state()
+    if "operation" in state:
+        return maintain_pause()
     if not state.get("pauseActive"):
         raise RuntimeError(f"{VACUUM_DISPLAY_NAME} pause is not currently active")
 
@@ -1083,6 +1343,7 @@ def reconcile_active_pause():
         }
     live_schedules = discover_schedules_with_recovery("Pause reconciliation")
     saved_schedules = snapshot["schedules"]
+    begin_reconciliation(snapshot, True, {item["uniqueId"]: False for item in saved_schedules})
     live_by_id = {schedule["uniqueId"]: schedule for schedule in live_schedules}
     saved_ids = {schedule["uniqueId"] for schedule in saved_schedules}
 
@@ -1109,6 +1370,7 @@ def reconcile_active_pause():
             f"Operation in progress: {len(changes)} schedule(s) are still ON; "
             "resuming the interrupted disable transaction."
         )
+        record_reconciliation_attempt(snapshot, changes)
         failures.extend(set_schedules_batch(changes))
 
     try:
@@ -1133,11 +1395,13 @@ def reconcile_active_pause():
     snapshot["pauseEstablishedAt"] = utc_now()
     persist_active_snapshot(snapshot)
 
+    observe_reconciliation(snapshot, final_schedules)
+    update_vacuum_action(snapshot, "return-to-dock-requested")
     handle_active_cleaning(snapshot)
 
     print()
-    print("RESULT: PASS")
-    print(f"All {len(saved_schedules)} {VACUUM_DISPLAY_NAME} schedules are OFF.")
+    print("RESULT: ACCEPTED; background settlement checks are pending.")
+    print(f"Homebridge currently displays all {len(saved_schedules)} schedules OFF.")
     print("Pause state remains ACTIVE and is recoverable.")
     print(f"===== END {VACUUM_DISPLAY_NAME.upper()} PAUSE RECONCILE =====")
     return 0
@@ -1187,7 +1451,7 @@ def main(config=None):
     if len(sys.argv) < 2:
         print(
             "Usage: <vacuum>-pause-controller.py "
-            "on|off|reconcile|abandon [--dry-run|--confirm PHRASE]",
+            "on|off|reconcile|maintain|abandon [--dry-run|--confirm PHRASE]",
             file=sys.stderr,
         )
         return 2
@@ -1195,12 +1459,14 @@ def main(config=None):
     command = sys.argv[1].lower()
     dry_run = "--dry-run" in sys.argv[2:]
 
-    if command not in ("on", "off", "reconcile", "abandon"):
+    if command not in ("on", "off", "reconcile", "maintain", "abandon"):
         print(f"ERROR: Unsupported command: {command}", file=sys.stderr)
         return 2
 
     try:
         with operation_lock():
+            if command == "maintain":
+                return maintain_pause()
             if command == "on":
                 return activate_pause()
 

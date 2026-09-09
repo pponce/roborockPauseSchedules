@@ -415,7 +415,7 @@ class ControllerTests(unittest.TestCase):
             "not-required-not-cleaning",
         )
 
-    def test_cleaning_away_from_dock_finishes_after_action_acknowledgement(self):
+    def test_cleaning_away_from_dock_finishes_after_homebridge_submission(self):
         snapshot = self.snapshot([], version=3)
         action = {
             "serviceName": MODULE.RETURN_TO_DOCK_SERVICE_NAME,
@@ -440,7 +440,7 @@ class ControllerTests(unittest.TestCase):
         sleep.assert_not_called()
         self.assertEqual(
             snapshot["vacuumAction"]["result"],
-            "return-to-dock-acknowledged",
+            "return-to-dock-submitted",
         )
         self.assertTrue(snapshot["vacuumAction"]["cleaningObserved"])
         self.assertIn("acknowledgedAt", snapshot["vacuumAction"])
@@ -637,8 +637,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(setter.call_args.args[0]["uniqueId"], "1")
         self.assertIs(setter.call_args.args[1], True)
         state = json.loads(self.paths["STATE_FILE"].read_text(encoding="utf-8"))
-        self.assertFalse(state["pauseActive"])
-        self.assertFalse(self.paths["SNAPSHOT_FILE"].exists())
+        self.assertTrue(state["pauseActive"])
+        self.assertFalse(MODULE.display_pause_state(state))
+        self.assertEqual(state["operation"]["phase"], "settling")
+        self.assertTrue(self.paths["SNAPSHOT_FILE"].exists())
 
     def test_matching_backup_recovers_missing_primary(self):
         self.write_json("STATE_FILE", self.active_state())

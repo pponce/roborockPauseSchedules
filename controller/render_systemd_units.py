@@ -13,6 +13,8 @@ from vacuum_registry import load_registry
 
 SERVICE_NAME = "roborock-pause-until-tomorrow.service"
 TIMER_NAME = "roborock-pause-until-tomorrow.timer"
+RECONCILE_SERVICE_NAME = "roborock-pause-reconcile.service"
+RECONCILE_TIMER_NAME = "roborock-pause-reconcile.timer"
 
 
 def render_units(registry):
@@ -45,7 +47,32 @@ Unit={SERVICE_NAME}
 [Install]
 WantedBy=timers.target
 """
-    return {SERVICE_NAME: service, TIMER_NAME: timer}
+    reconcile_service = f"""[Unit]
+Description=Reconcile Roborock pause operations against Homebridge
+After=network-online.target {settings['homebridgeUnit']}
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={settings['user']}
+Group={settings['group']}
+WorkingDirectory={root}
+ExecStart={settings['bashPath']} -c 'python3 controller/all-vacuums-pause-controller.py maintain'
+"""
+    reconcile_timer = f"""[Unit]
+Description=Recheck Roborock pause operations every minute
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=60
+Unit={RECONCILE_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+"""
+    return {SERVICE_NAME: service, TIMER_NAME: timer,
+            RECONCILE_SERVICE_NAME: reconcile_service,
+            RECONCILE_TIMER_NAME: reconcile_timer}
 
 
 def write_units(units, output_directory):

@@ -24,6 +24,8 @@ class RenderSystemdUnitsTests(unittest.TestCase):
             },
         }
         units = MODULE.render_units(registry)
+        for name in (MODULE.RECONCILE_SERVICE_NAME, MODULE.RECONCILE_TIMER_NAME):
+            self.assertEqual(units[name], (ROOT / "systemd" / name).read_text(encoding="utf-8"))
         self.assertEqual(
             units[MODULE.SERVICE_NAME],
             (ROOT / "systemd" / MODULE.SERVICE_NAME).read_text(encoding="utf-8"),

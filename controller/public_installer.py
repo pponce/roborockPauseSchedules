@@ -125,8 +125,8 @@ def command_switches(registry):
     return {
         "version": 1,
         "contract": {
-            "on": "exit zero only after verified activation",
-            "off": "exit zero only after verified restoration",
+            "on": "exit zero after acceptance; inspect background reconciliation status",
+            "off": "exit zero after acceptance; retain snapshot until observed settlement",
             "state": "print exactly true or false and exit zero",
         },
         "switches": switches,
@@ -239,6 +239,8 @@ def validate_stage(stage_directory):
         COMMANDS_NAME,
         f"{SYSTEMD_DIRECTORY}/roborock-pause-until-tomorrow.service",
         f"{SYSTEMD_DIRECTORY}/roborock-pause-until-tomorrow.timer",
+        f"{SYSTEMD_DIRECTORY}/roborock-pause-reconcile.service",
+        f"{SYSTEMD_DIRECTORY}/roborock-pause-reconcile.timer",
     }
     if set(artifacts) != required:
         raise ValueError("stage manifest does not contain the required artifacts")
@@ -285,9 +287,47 @@ def validate_state_file(path, vacuum_id, require_inactive=False):
         or not state["sessionId"]
     ):
         raise ValueError(f"state file schema is invalid: {path}")
-    if require_inactive and state["pauseActive"]:
+    if "pendingActivation" in state and not isinstance(state["pendingActivation"], bool):
+        raise ValueError(f"pending activation state is invalid: {path}")
+    if "operation" in state and (
+        not isinstance(state["operation"], dict)
+        or state["operation"].get("phase") not in ("planning", "settling", "complete", "needs-attention")
+    ):
+        raise ValueError(f"operation state is invalid: {path}")
+    if require_inactive and (state["pauseActive"] or state.get("pendingActivation")
+                             or state.get("operation", {}).get("phase", "complete") != "complete"):
         raise ValueError(f"operation requires an inactive pause state: {path}")
     return state
+
+
+def unresolved_snapshot(path, state):
+    """Retained, settled restore records are archives, not active transactions."""
+    path = Path(path)
+    if not path.exists():
+        return "operation" in state
+    if path.is_symlink():
+        return True
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        operation = snapshot["reconciliation"]
+        summary = state["operation"]
+        return not (
+            snapshot.get("version") == 3
+            and snapshot.get("vacuumId") == state["vacuumId"]
+            and snapshot.get("sessionId") == state["sessionId"]
+            and operation.get("version") == 1
+            and isinstance(operation.get("operationId"), str)
+            and bool(operation["operationId"])
+            and operation.get("operationId") == summary["operationId"]
+            and operation.get("auditOnly") is True
+            and operation.get("desiredPause") is False
+            and operation.get("phase") == "complete"
+            and summary.get("phase") == "complete"
+            and summary.get("desiredPause") is False
+            and state["pauseActive"] is False
+        )
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return True
 
 
 def install_plan(stage_directory, systemd_directory=None):
@@ -618,7 +658,7 @@ def unified_migration_plan(stage_directory):
             state_path(current, vacuum_id), vacuum_id, require_inactive=True
         )
         primary = root / "controller" / f"{vacuum_id}-pause-snapshot.json"
-        if primary.exists():
+        if unresolved_snapshot(primary, state):
             raise ValueError(
                 f"unified migration requires no active snapshot: {primary}"
             )
@@ -708,11 +748,11 @@ def unified_reconfiguration_plan(stage_directory):
     root = current["root"]
     current_ids = {vacuum["id"] for vacuum in current["vacuums"]}
     for vacuum_id in sorted(current_ids):
-        validate_state_file(
+        state = validate_state_file(
             state_path(current, vacuum_id), vacuum_id, require_inactive=True
         )
         primary = root / "controller" / f"{vacuum_id}-pause-snapshot.json"
-        if primary.exists():
+        if unresolved_snapshot(primary, state):
             raise ValueError(
                 f"managed reconfiguration requires no active snapshot: {primary}"
             )
@@ -910,11 +950,11 @@ def source_upgrade_plan(target, root=None):
         raise RuntimeError("; ".join(errors))
     for vacuum in registry["vacuums"]:
         vacuum_id = vacuum["id"]
-        validate_state_file(
+        state = validate_state_file(
             state_path(registry, vacuum_id), vacuum_id, require_inactive=True
         )
         snapshot = checkout / "controller" / f"{vacuum_id}-pause-snapshot.json"
-        if snapshot.exists():
+        if unresolved_snapshot(snapshot, state):
             raise ValueError(f"source upgrade requires no active snapshot: {snapshot}")
     changed = run_git(
         checkout, "diff", "--name-only", f"{current}..{target_commit}"

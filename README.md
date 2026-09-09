@@ -353,28 +353,64 @@ python3 render-systemd-units.py --help
 
 ## Recovery and uninstalling
 
-Schedule reads use a finite retry window so an account-session recovery in the
-Roborock Homebridge plugin can finish without creating an unbounded controller
-operation. A repeated ON request reconciles an existing incomplete transaction:
-it reads current state first, disables only schedules still observed ON, and
-verifies the result. `Pause All` remains ON for a valid active transaction while
-reporting whether it is complete, in progress, or requires recovery; malformed
-or mismatched state still fails closed. Runtime state and snapshot JSON files
-are replaced atomically with mode `0600`.
+Homebridge can acknowledge a switch write and display the requested value before
+Roborock finishes it. Matching switch values are therefore best-effort observations,
+not proof of robot acknowledgement. The controller preserves its desired operation
+and snapshot and checks again using the existing Homebridge API; no separate
+Roborock login or plugin-specific API is required.
 
-When a vacuum is actively cleaning, activation verifies that its schedules are
-OFF and then submits Return to Dock. The pause transaction is complete when that
-command is acknowledged; it does not wait for or claim that the vacuum physically
-reached the dock. Dock-arrival monitoring is intentionally outside this project's
-scope.
+Enable the additional `roborock-pause-reconcile.timer` after deploying the updated
+runtime. It checks pending operations approximately every minute. Settlement needs
+three matching observations spanning at least 120 seconds; outages and long gaps
+reset that window. This is a heuristic, not a guarantee that cloud work is finished.
+Only mismatched schedules are retried, at least 120 seconds apart, with at most
+three total write attempts per schedule per operation. Exhausted operations keep
+their snapshots and can still settle if a later observation matches.
+
+Completed operations retain their snapshots and are checked approximately every
+five minutes. A later disagreement changes status to `needs-attention` and corrects
+the displayed Pause All state. These checks do not overwrite possible manual edits.
+A plugin rollback after settlement is indistinguishable from a manual edit, so it
+is reported rather than automatically reversed. Repeated presses adopt an existing
+operation without resetting its retry budget. Opposite requests supersede unfinished
+operations; an OFF request is persisted before discovery so an outage at midnight
+does not leave automatic pause retries running.
+
+During settlement the switch displays the requested state. On a known disagreement
+requiring attention it reflects whether Homebridge shows that vacuum's schedules
+all OFF; the aggregate switch is ON if any vacuum reports ON. The persisted
+`pauseActive` field separately records restoration ownership and must not be used
+as proof that schedules are disabled. Existing completed pauses are adopted for
+read-only monitoring; recorded incomplete activations may resume.
+
+When Homebridge displays the schedules OFF, a cleaning vacuum receives one Return
+to Dock request. `return-to-dock-submitted` means Homebridge accepted the press,
+not robot acknowledgement. Neither docking arrival nor a repeated docking command
+is required for schedule settlement. An ambiguous submitted action is not replayed
+after restart. Runtime JSON files are replaced atomically with mode `0600`.
 
 The Script2-facing Pause All ON and OFF wrappers dispatch their aggregate work
 to a detached controller process, allowing the HomeKit write callback to return
 promptly instead of waiting for every Roborock schedule transaction. The direct
-Python `on` and `off` commands remain synchronous for administration and tests.
+Python `on` and `off` commands wait for the initial attempt but may return
+`ACCEPTED` while background settlement remains pending. Exit zero alone does not
+mean that schedules have settled.
 Background output is written privately to
 `controller/all-vacuums-pause-operation.log`; the state command continues to
-report the persisted, verified controller state as the operation progresses.
+report the persisted controller view as the operation progresses. To inspect the
+per-vacuum phase, desired state and latest error, run
+`python3 controller/all-vacuums-pause-controller.py status` from the installed root.
+`maintain` performs one reconciliation cycle; normal periodic use is owned by the
+new systemd timer, not by a HomeKit state-read callback.
+
+The renderer and installer stage now include both reconciliation unit files in
+addition to the midnight units. Review and install the generated
+`roborock-pause-reconcile.service` and `roborock-pause-reconcile.timer` in the same
+way as the midnight pair, then enable the reconciliation timer. Rendering or
+updating the source checkout does not install or enable it. Its working directory
+must be the deployed runtime, not a separate source checkout. Stop the reconciliation
+timer during runtime upgrades. Settled restore snapshots are retained recovery
+records and do not block installer upgrades; unresolved operations still do.
 
 If a normal `off` or `reconcile` fails, do not delete state or snapshot files.
 Fix Homebridge/cloud connectivity and retry. The emergency `abandon` command

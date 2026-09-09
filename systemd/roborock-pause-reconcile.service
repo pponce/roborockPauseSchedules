@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile Roborock pause operations against Homebridge
+After=network-online.target homebridge.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=homebridge
+Group=homebridge
+WorkingDirectory=/var/lib/homebridge/roborockPauseSchedules
+ExecStart=/usr/bin/bash -c 'python3 controller/all-vacuums-pause-controller.py maintain'

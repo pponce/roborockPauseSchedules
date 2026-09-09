@@ -119,6 +119,8 @@ class PublicInstallerTests(unittest.TestCase):
                 "command-switches.json",
                 "systemd/roborock-pause-until-tomorrow.service",
                 "systemd/roborock-pause-until-tomorrow.timer",
+                "systemd/roborock-pause-reconcile.service",
+                "systemd/roborock-pause-reconcile.timer",
             },
         )
         commands = json.loads((stage_path / "command-switches.json").read_text())

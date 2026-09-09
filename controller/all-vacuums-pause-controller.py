@@ -54,8 +54,22 @@ def load_vacuum_state(vacuum):
         raise RuntimeError(f"{vacuum['displayName']}: sessionId is invalid")
 
     state["transactionStatus"] = "inactive"
+    if state.get("pendingActivation") is True:
+        state["transactionStatus"] = "planning"
+        return state
     if state["pauseActive"]:
         state["transactionStatus"] = validate_active_snapshot(vacuum, state)
+    if "operation" in state:
+        operation = state["operation"]
+        if (not isinstance(operation, dict)
+                or not isinstance(operation.get("desiredPause"), bool)
+                or not isinstance(operation.get("displayPause"), bool)
+                or operation.get("phase") not in ("planning", "settling", "complete", "needs-attention")):
+            raise RuntimeError(f"{vacuum['displayName']}: operation summary is invalid")
+        # The state file is an atomic UI summary. Reconciliation validates its
+        # snapshot under the writer lock; readers must not compare two files
+        # mid-update and turn a normal publication race into a HomeKit error.
+        state["transactionStatus"] = operation["phase"]
 
     return state
 
@@ -100,6 +114,7 @@ def validate_active_snapshot(vacuum, state):
         "pending-schedule-disable",
         "return-to-dock-requested",
         "return-to-dock-acknowledged",
+        "return-to-dock-submitted",
         "not-required-idle-docked",
         "not-required-not-cleaning",
         "transition-confirmed",
@@ -116,6 +131,7 @@ def validate_active_snapshot(vacuum, state):
     )
     successful_actions = {
         "return-to-dock-acknowledged",
+        "return-to-dock-submitted",
         "not-required-idle-docked",
         "not-required-not-cleaning",
         "transition-confirmed",
@@ -128,10 +144,12 @@ def validate_active_snapshot(vacuum, state):
 
 
 def read_states():
-    return {
-        vacuum["id"]: load_vacuum_state(vacuum)["pauseActive"]
-        for vacuum in VACUUMS
-    }
+    return {vacuum_id: display_state(state)
+            for vacuum_id, state in read_state_details().items()}
+
+
+def display_state(state):
+    return state.get("pendingActivation") is True or state.get("operation", {}).get("displayPause", state["pauseActive"])
 
 
 def read_state_details():
@@ -205,7 +223,10 @@ def set_all(desired):
     targets = []
     for vacuum in VACUUMS:
         state = initial_details[vacuum["id"]]
-        if state["pauseActive"] != desired:
+        requested = state.get("pendingActivation") is True or state.get("operation", {}).get("desiredPause", state["pauseActive"])
+        if requested != desired:
+            targets.append(vacuum)
+        elif state.get("operation") and state["transactionStatus"] != "complete":
             targets.append(vacuum)
         elif desired and state["transactionStatus"] != "complete":
             targets.append(vacuum)
@@ -261,7 +282,7 @@ def set_all(desired):
 
     final_details = read_state_details()
     final = {
-        vacuum_id: state["pauseActive"]
+        vacuum_id: display_state(state)
         for vacuum_id, state in final_details.items()
     }
     failures = [
@@ -296,6 +317,11 @@ def set_all(desired):
             print(f"  - {failure}")
         return 1
 
+    if any(state.get("pendingActivation") or state.get("operation", {}).get("phase") in ("planning", "settling", "needs-attention")
+           for state in final_details.values()):
+        print("RESULT: ACCEPTED; background reconciliation remains pending.")
+        return 0
+
     print()
     print("RESULT: PASS")
     print(f"All vacuums are {'ACTIVE' if desired else 'INACTIVE'}.")
@@ -313,6 +339,19 @@ def expire_pauses():
     return set_all(False)
 
 
+def maintain_all():
+    failures = []
+    for vacuum in VACUUMS:
+        # Each child owns its per-vacuum lock and journal. Continue checking
+        # other vacuums when one cannot reach Homebridge.
+        command = [sys.executable, str(Path(ROOT) / "controller" / "vacuum-pause-controller.py"),
+                   vacuum["id"], "maintain"]
+        result = subprocess.run(command, check=False)
+        if result.returncode:
+            failures.append(vacuum["id"])
+    return 1 if failures else 0
+
+
 def main():
     if len(sys.argv) != 2 or sys.argv[1].lower() not in (
         "on",
@@ -321,10 +360,12 @@ def main():
         "dispatch-off",
         "state",
         "expire",
+        "maintain",
+        "status",
     ):
         print(
             "Usage: all-vacuums-pause-controller.py "
-            "on|off|dispatch-on|dispatch-off|state|expire",
+            "on|off|dispatch-on|dispatch-off|state|status|expire|maintain",
             file=sys.stderr,
         )
         return 2
@@ -340,8 +381,13 @@ def main():
         if command == "state":
             print("true" if combined_state(read_states()) else "false")
             return 0
+        if command == "status":
+            print(json.dumps(read_state_details(), indent=2))
+            return 0
 
         with operation_lock():
+            if command == "maintain":
+                return maintain_all()
             if command == "expire":
                 return expire_pauses()
             return set_all(command == "on")
