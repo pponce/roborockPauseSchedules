@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import fcntl
+from functools import wraps
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -111,7 +112,11 @@ SCHEDULE_VERIFICATION_RETRY_DELAYS_SECONDS = (1, 2, 4, 8, 10)
 SETTLE_SECONDS = 120
 OBSERVATION_MIN_SECONDS = 30
 OBSERVATION_MAX_GAP_SECONDS = 150
-AUDIT_INTERVAL_SECONDS = 300
+VERIFICATION_WINDOW_SECONDS = 600
+# Allow the default five-minute plugin cache to refresh before settlement.
+EARLIEST_SETTLEMENT_SECONDS = 360
+AUDIT_INTERVAL_SECONDS = 60
+REQUEST_WINDOW = None
 WRITE_RETRY_SECONDS = 120
 MAX_WRITE_ATTEMPTS = 3
 SUPPORTED_SNAPSHOT_VERSIONS = (1, 2, 3)
@@ -145,6 +150,56 @@ def load_json(path):
         return json.load(handle)
 
 
+class VerificationWindowExpired(RuntimeError):
+    pass
+
+
+def new_verification_window():
+    now = time.time()
+    return {"startedAt": now, "endsAt": now + VERIFICATION_WINDOW_SECONDS, "closed": False}
+
+
+def validate_window(window):
+    if (not isinstance(window, dict) or type(window.get("closed")) is not bool
+            or any(type(window.get(key)) not in (int, float)
+                   or not math.isfinite(window[key]) or window[key] < 0
+                   for key in ("startedAt", "endsAt"))
+            or not 0 <= window["endsAt"] - window["startedAt"] <= VERIFICATION_WINDOW_SECONDS):
+        raise RuntimeError("Verification window is invalid")
+
+
+def window_open(window):
+    if window is None:  # Old journals never acquire a fresh budget on a timer tick.
+        return False
+    validate_window(window)
+    return not window["closed"] and window["startedAt"] <= time.time() < window["endsAt"]
+
+
+def require_request_window():
+    if REQUEST_WINDOW is not None and not window_open(REQUEST_WINDOW):
+        raise VerificationWindowExpired("Verification window ended; no further Homebridge requests")
+
+
+def bounded_operation(function):
+    """Scope the request guard to this command, including its worker threads."""
+    @wraps(function)
+    def bounded(*args, **kwargs):
+        global REQUEST_WINDOW
+        previous = REQUEST_WINDOW
+        try:
+            return function(*args, **kwargs)
+        finally:
+            REQUEST_WINDOW = previous
+    return bounded
+
+
+def use_window(window):
+    global REQUEST_WINDOW
+    validate_window(window)
+    REQUEST_WINDOW = window
+    require_request_window()
+
+
 def load_state():
     state = load_json(STATE_FILE)
     if state.get("version") != 1 or state.get("vacuumId") != VACUUM_ID:
@@ -155,6 +210,8 @@ def load_state():
         raise RuntimeError("Pause state sessionId is invalid")
     if "pendingActivation" in state and not isinstance(state["pendingActivation"], bool):
         raise RuntimeError("Pause pendingActivation is invalid")
+    if "pendingActivationWindow" in state:
+        validate_window(state["pendingActivationWindow"])
     operation = state.get("operation")
     if "operation" in state and (
         not isinstance(operation, dict)
@@ -306,6 +363,7 @@ def write_token_atomic(token):
 
 
 def refresh_access_token():
+    require_request_window()
     username, password = load_auto_auth_credentials()
     data = json.dumps({"username": username, "password": password}).encode("utf-8")
     request = urllib.request.Request(
@@ -344,6 +402,7 @@ def refresh_access_token_if_stale(failed_token=None):
 
 
 def api_request(method, path, body=None, timeout=API_READ_TIMEOUT_SECONDS):
+    require_request_window()
     try:
         token = load_token()
     except RuntimeError:
@@ -365,6 +424,7 @@ def api_request(method, path, body=None, timeout=API_READ_TIMEOUT_SECONDS):
 
 
 def api_request_with_token(method, path, body, token, timeout):
+    require_request_window()
 
     url = BASE_URL + path
 
@@ -533,6 +593,7 @@ def update_vacuum_action(snapshot, result, **fields):
 
 
 def handle_active_cleaning(snapshot):
+    require_request_window()
     try:
         state = discover_vacuum_state(require_action=True)
     except Exception as exc:
@@ -704,6 +765,10 @@ def validate_reconciliation(snapshot):
             raise RuntimeError(f"Reconciliation {key} is invalid")
     if type(operation.get("samples")) is not int or operation["samples"] < 0:
         raise RuntimeError("Reconciliation sample count is invalid")
+    if "window" in operation:
+        validate_window(operation["window"])
+    if "planningRequired" in operation and type(operation["planningRequired"]) is not bool:
+        raise RuntimeError("Reconciliation planningRequired is invalid")
 
 
 def save_reconciliation(snapshot):
@@ -724,20 +789,25 @@ def save_reconciliation(snapshot):
         "phase": operation["phase"],
         "displayPause": display,
         "lastError": operation.get("lastError"),
+        "window": operation.get("window"),
+        "planningRequired": operation.get("planningRequired", False),
         "updatedAt": utc_now(),
     }
     write_json_atomic(STATE_FILE, state)
 
 
-def begin_reconciliation(snapshot, desired, targets, *, planning=False, superseded=False, audit_only=False):
+def begin_reconciliation(snapshot, desired, targets, *, planning=False, superseded=False, audit_only=False, window=None):
     if snapshot["version"] < 3:
         snapshot["version"] = 3
         snapshot["vacuumAction"] = {"result": "pending-schedule-disable", "updatedAt": utc_now()}
+    window = new_verification_window() if window is None else dict(window)
+    use_window(window)
     snapshot["reconciliation"] = {
         "version": 1,
         "operationId": session_id(),
         "desiredPause": desired,
         "phase": "planning" if planning else "settling",
+        "planningRequired": planning,
         "targets": dict(targets),
         "attempts": {key: 0 for key in targets},
         "nextRetryAt": 0,
@@ -746,11 +816,13 @@ def begin_reconciliation(snapshot, desired, targets, *, planning=False, supersed
         "samples": 0,
         "auditOnly": audit_only,
         "supersededPendingPause": superseded,
+        "window": window,
     }
     save_reconciliation(snapshot)
 
 
 def record_reconciliation_attempt(snapshot, changes):
+    require_request_window()
     operation = snapshot["reconciliation"]
     for schedule, _ in changes:
         operation["attempts"][schedule["uniqueId"]] += 1
@@ -762,6 +834,7 @@ def record_reconciliation_attempt(snapshot, changes):
 
 
 def observe_reconciliation(snapshot, live, *, retry=False):
+    require_request_window()
     operation = snapshot["reconciliation"]
     now = time.time()
     live_by_id = {item["uniqueId"]: item for item in live}
@@ -805,7 +878,8 @@ def observe_reconciliation(snapshot, live, *, retry=False):
         operation["samples"] += 1
         operation["lastObservationAt"] = now
     settled = (operation["samples"] >= 3
-               and now - operation["matchingSince"] >= SETTLE_SECONDS)
+               and now - operation["matchingSince"] >= SETTLE_SECONDS
+               and now - operation["window"]["startedAt"] >= EARLIEST_SETTLEMENT_SECONDS)
     operation["phase"] = "complete" if settled else "settling"
     if settled:
         operation["auditOnly"] = True
@@ -816,31 +890,67 @@ def observe_reconciliation(snapshot, live, *, retry=False):
     return settled
 
 
+def close_verification_window(snapshot):
+    operation = snapshot["reconciliation"]
+    window = operation.get("window")
+    if window is not None and window["closed"]:
+        return
+    if window is None:
+        now = time.time()
+        window = {"startedAt": now, "endsAt": now, "closed": True}
+        operation["window"] = window
+    else:
+        window["closed"] = True
+    if operation["phase"] == "planning":
+        operation["planningRequired"] = True
+    if operation["phase"] != "complete":
+        operation["phase"] = "needs-attention"
+        operation["lastError"] = "Verification ended without settlement; explicitly retry or restore."
+    save_reconciliation(snapshot)
+    print(f"{VACUUM_DISPLAY_NAME}: verification stopped ({operation['phase']}); snapshot retained.")
+
+
+def close_pending_activation(state):
+    window = state.get("pendingActivationWindow")
+    if window is not None and window["closed"]:
+        return
+    if window is None:
+        now = time.time()
+        window = {"startedAt": now, "endsAt": now, "closed": True}
+    window["closed"] = True
+    state["pendingActivationWindow"] = window
+    write_json_atomic(STATE_FILE, state)
+    print(f"{VACUUM_DISPLAY_NAME}: activation needs attention; discovery window ended before any writes.")
+
+
+@bounded_operation
 def maintain_pause():
-    """One bounded observation/retry cycle, under the existing per-vacuum lock."""
+    """Idle ticks inspect local files only; a user request owns a fixed budget."""
     state = load_state()
     if state.get("pendingActivation") is True:
+        if not window_open(state.get("pendingActivationWindow")):
+            close_pending_activation(state)
+            return 0
+        use_window(state["pendingActivationWindow"])
         return activate_pause()
     if "operation" not in state and not state["pauseActive"]:
         return 0
     snapshot = load_active_snapshot(state)
     if "reconciliation" not in snapshot:
-        # Completed legacy pauses are observation-only. A recorded incomplete
-        # activation can resume, including a crash before its first write.
-        pending = snapshot.get("vacuumAction", {}).get("result") == "pending-schedule-disable"
-        begin_reconciliation(snapshot, True,
-                             {item["uniqueId"]: False for item in snapshot["schedules"]},
-                             audit_only=not pending)
+        return 0  # Legacy pauses remain restorable; no unsolicited adoption/reads.
     operation = snapshot["reconciliation"]
-    if operation["phase"] == "planning":
+    if not window_open(operation.get("window")):
+        close_verification_window(snapshot)
+        return 0
+    use_window(operation["window"])
+    if operation["phase"] == "planning" or operation.get("planningRequired", False):
         return deactivate_pause()
     last_at = operation["lastObservationAt"]
-    if (operation["auditOnly"] and last_at is not None
-            and 0 <= time.time() - last_at < AUDIT_INTERVAL_SECONDS):
-        save_reconciliation(snapshot)
+    if last_at is not None and 0 <= time.time() - last_at < AUDIT_INTERVAL_SECONDS:
         return 0
     try:
         live = discover_schedules()
+        require_request_window()
         observe_reconciliation(snapshot, live, retry=True)
         if (not operation["auditOnly"] and operation["desiredPause"] and all(not item["on"] for item in live)
                 and snapshot.get("vacuumAction", {}).get("result") == "pending-schedule-disable"):
@@ -861,7 +971,7 @@ def maintain_pause():
 
 def display_pause_state(state):
     if state.get("pendingActivation") is True:
-        return True
+        return not state.get("pendingActivationWindow", {}).get("closed", False)
     operation = state.get("operation")
     if operation is None:
         return state["pauseActive"]
@@ -892,6 +1002,7 @@ def set_schedule(schedule, desired):
 
 def set_schedules_batch(changes):
     """Submit related switch writes together so the plugin can batch them."""
+    require_request_window()
     if not changes:
         return []
 
@@ -916,8 +1027,11 @@ def discover_schedules_with_recovery(context):
     last_error = None
     attempts = len(SCHEDULE_VERIFICATION_RETRY_DELAYS_SECONDS) + 1
     for attempt in range(attempts):
+        require_request_window()
         try:
             return discover_schedules()
+        except VerificationWindowExpired:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt == attempts - 1:
@@ -937,8 +1051,11 @@ def discover_schedules_with_recovery(context):
 
 def verify_schedule_changes(changes):
     for attempt in range(len(SCHEDULE_VERIFICATION_RETRY_DELAYS_SECONDS) + 1):
+        require_request_window()
         try:
             live = discover_schedules()
+        except VerificationWindowExpired:
+            raise
         except Exception as exc:
             if attempt == len(SCHEDULE_VERIFICATION_RETRY_DELAYS_SECONDS):
                 raise RuntimeError(
@@ -998,6 +1115,7 @@ def verify_all_off(schedules):
     return failures
 
 
+@bounded_operation
 def activate_pause():
     print(f"===== {VACUUM_DISPLAY_NAME.upper()} PAUSE ACTIVATE =====")
     print()
@@ -1007,7 +1125,10 @@ def activate_pause():
         if state["pauseActive"]:
             snapshot = load_active_snapshot(state)
             if "reconciliation" in snapshot:
-                if not snapshot["reconciliation"]["desiredPause"]:
+                operation = snapshot["reconciliation"]
+                if (not operation["desiredPause"]
+                        or (not window_open(operation.get("window"))
+                            and operation["phase"] != "complete")):
                     begin_reconciliation(snapshot, True, {
                         item["uniqueId"]: False for item in snapshot["schedules"]
                     })
@@ -1038,9 +1159,14 @@ def activate_pause():
     if not os.path.exists(STATE_FILE):
         persist_state(False, session_id())
     state = load_state()
+    if not state.get("pendingActivation") or not window_open(state.get("pendingActivationWindow")):
+        state["pendingActivationWindow"] = new_verification_window()
     state["pendingActivation"] = True
     write_json_atomic(STATE_FILE, state)
+    activation_window = state["pendingActivationWindow"]
+    use_window(activation_window)
     schedules = discover_schedules_with_recovery("Pause activation discovery")
+    require_request_window()
 
     if not schedules:
         raise RuntimeError(f"No {VACUUM_DISPLAY_NAME} schedules were discovered")
@@ -1084,7 +1210,7 @@ def activate_pause():
     persist_active_snapshot(snapshot)
     begin_reconciliation(snapshot, True, {
         item["uniqueId"]: False for item in snapshot_schedules
-    })
+    }, window=activation_window)
 
     print()
     print(f"===== TURNING {VACUUM_DISPLAY_NAME.upper()} SCHEDULES OFF =====")
@@ -1177,6 +1303,7 @@ def activate_pause():
     return 0
 
 
+@bounded_operation
 def deactivate_pause(dry_run=False):
     print(f"===== {VACUUM_DISPLAY_NAME.upper()} PAUSE DEACTIVATE =====")
     print()
@@ -1188,12 +1315,21 @@ def deactivate_pause(dry_run=False):
     if state.get("pendingActivation") is True:
         if not dry_run:
             state.pop("pendingActivation")
+            state.pop("pendingActivationWindow", None)
             write_json_atomic(STATE_FILE, state)
         print("Pending activation cancelled before any schedule writes.")
         return 0
 
     if (not dry_run and state.get("operation", {}).get("desiredPause") is False
-            and state["operation"].get("phase") != "planning"):
+            and state["operation"].get("phase") != "planning"
+            and not state["operation"].get("planningRequired", False)):
+        snapshot = load_active_snapshot(state)
+        operation = snapshot["reconciliation"]
+        if not window_open(operation.get("window")) and operation["phase"] != "complete":
+            # An explicit retry keeps the original restore targets, not a new
+            # plan derived from a switch that may have rolled back late.
+            begin_reconciliation(snapshot, False, operation["targets"],
+                                 superseded=operation["supersededPendingPause"])
         return maintain_pause()
     if not state.get("pauseActive"):
         raise RuntimeError(f"{VACUUM_DISPLAY_NAME} pause is not currently active")
@@ -1204,12 +1340,16 @@ def deactivate_pause(dry_run=False):
     pending_pause = (previous_operation.get("desiredPause") is True
                      and not previous_operation.get("auditOnly", False))
     pending_pause = pending_pause or previous_operation.get("supersededPendingPause", False)
-    if not dry_run and previous_operation.get("phase") != "planning":
+    if not dry_run and (previous_operation.get("phase") != "planning"
+                        or not window_open(previous_operation.get("window"))):
         # Record OFF before discovery so an outage at midnight cannot allow
         # the maintenance timer to continue retrying the superseded ON.
         begin_reconciliation(snapshot, False, {}, planning=True, superseded=pending_pause)
 
+    if not dry_run:
+        use_window(snapshot["reconciliation"]["window"])
     live_schedules = discover_schedules_with_recovery("Unpause discovery")
+    require_request_window()
 
     live_by_id = {schedule["uniqueId"]: schedule for schedule in live_schedules}
 
@@ -1289,7 +1429,7 @@ def deactivate_pause(dry_run=False):
     ]
     begin_reconciliation(snapshot, False, {
         schedule["uniqueId"]: desired for schedule, desired in changes
-    }, superseded=pending_pause)
+    }, superseded=pending_pause, window=snapshot["reconciliation"]["window"])
     changes = [(schedule, desired) for schedule, desired in changes
                if live_by_id[schedule["uniqueId"]]["on"] != desired]
     for schedule, desired in changes:
@@ -1323,6 +1463,7 @@ def deactivate_pause(dry_run=False):
     return 0
 
 
+@bounded_operation
 def reconcile_active_pause():
     """Read first, then safely finish an interrupted active pause transaction."""
     print(f"===== {VACUUM_DISPLAY_NAME.upper()} PAUSE RECONCILE =====")
@@ -1330,6 +1471,13 @@ def reconcile_active_pause():
 
     state = load_state()
     if "operation" in state:
+        snapshot = load_active_snapshot(state)
+        operation = snapshot["reconciliation"]
+        if not window_open(operation.get("window")):
+            if operation["phase"] == "planning" or operation.get("planningRequired", False):
+                return deactivate_pause()
+            begin_reconciliation(snapshot, operation["desiredPause"], operation["targets"],
+                                 superseded=operation["supersededPendingPause"])
         return maintain_pause()
     if not state.get("pauseActive"):
         raise RuntimeError(f"{VACUUM_DISPLAY_NAME} pause is not currently active")
@@ -1341,9 +1489,10 @@ def reconcile_active_pause():
             "result": "pending-schedule-disable",
             "updatedAt": utc_now(),
         }
-    live_schedules = discover_schedules_with_recovery("Pause reconciliation")
     saved_schedules = snapshot["schedules"]
     begin_reconciliation(snapshot, True, {item["uniqueId"]: False for item in saved_schedules})
+    live_schedules = discover_schedules_with_recovery("Pause reconciliation")
+    require_request_window()
     live_by_id = {schedule["uniqueId"]: schedule for schedule in live_schedules}
     saved_ids = {schedule["uniqueId"] for schedule in saved_schedules}
 

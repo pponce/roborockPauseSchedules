@@ -63,3 +63,8 @@
       state.
 - [ ] Known cloud throttling, stale Homebridge state, or incomplete recovery
       blocks live Pause All testing without blocking a source-only release.
+
+- [ ] Pause and restore stop all background API work at their persisted deadline.
+- [ ] Restart, initial-discovery failure, and restore planning cannot renew the window.
+- [ ] Legacy completed operations stop indefinite auditing without network calls.
+- [ ] Expired operations retain recovery data and can be retried explicitly.

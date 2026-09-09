@@ -42,16 +42,16 @@ the separate midnight-expiration timer is optional.
 4. Extract the ZIP and move the extracted folder to the final installation
    path.
 
-Example for v1.0.1, from the directory containing both downloads. Use the
+Example for v1.0.2, from the directory containing both downloads. Use the
 attached project ZIP, rather than GitHub's automatic **Source code (zip)**.
 These commands are for a **fresh installation**; the destination must not
 already exist:
 
 ```bash
-sha256sum --check roborockPauseSchedules-1.0.1.zip.sha256 &&
-unzip roborockPauseSchedules-1.0.1.zip &&
+sha256sum --check roborockPauseSchedules-1.0.2.zip.sha256 &&
+unzip roborockPauseSchedules-1.0.2.zip &&
 test ! -e /var/lib/homebridge/roborockPauseSchedules &&
-sudo mv roborockPauseSchedules-1.0.1 /var/lib/homebridge/roborockPauseSchedules &&
+sudo mv roborockPauseSchedules-1.0.2 /var/lib/homebridge/roborockPauseSchedules &&
 sudo chown -R homebridge:homebridge /var/lib/homebridge/roborockPauseSchedules &&
 cd /var/lib/homebridge/roborockPauseSchedules
 ```
@@ -295,10 +295,17 @@ Two independent timers serve different purposes:
 | `roborock-pause-reconcile.timer` | Rechecks pending pause/restore operations and retries mismatched schedules within their budget. | 60 seconds after boot and 60 seconds after the previous service run finishes. |
 | `roborock-pause-until-tomorrow.timer` | Requests restoration of active pauses when Pause Until Tomorrow is ON. | Optional; 00:05 local time by default. |
 
-Keep reconciliation enabled even if you disable Pause Until Tomorrow. A timer
-invocation checks pending work approximately every minute; completed operations
-are polled no more often than about every five minutes. With no pause history
-requiring monitoring, a run can finish without a Homebridge request.
+Keep reconciliation enabled even if you disable Pause Until Tomorrow. Each pause
+or restore request opens a **ten-minute verification window for the affected
+vacuum**. Timer ticks observe Homebridge approximately once per minute during that
+window. Outside it, they inspect local files only: **no Homebridge reads, schedule
+writes, or docking requests**. Completed restores no longer cause overnight audits.
+
+Systemd supplies a reliable wake-up after the button command exits, including
+across restarts. A separate daemon is unnecessary. The timer remains enabled but
+does no network work when idle; an alternative scheduler can call `maintain` at
+the same cadence. Do not run both. Existing v1.0.1 timer/service files are unchanged
+and do not need reinstalling for v1.0.2.
 
 ### Render and review reconciliation units
 
@@ -532,29 +539,49 @@ not proof of robot acknowledgement. The controller preserves its desired operati
 and snapshot and checks again using the existing Homebridge API; no separate
 Roborock login or plugin-specific API is required.
 
-Enable the additional `roborock-pause-reconcile.timer` after deploying the updated
-runtime. It checks pending operations approximately every minute. Settlement needs
-three matching observations spanning at least 120 seconds; outages and long gaps
-reset that window. This is a heuristic, not a guarantee that cloud work is finished.
-Only mismatched schedules are retried, at least 120 seconds apart, with at most
-three total write attempts per schedule per operation. Exhausted operations keep
-their snapshots and can still settle if a later observation matches.
+Enable `roborock-pause-reconcile.timer` after deploying the runtime. Each user
+pause or restore, including a midnight restore, has a fixed ten-minute deadline
+persisted before discovery. Pause All creates a window for each affected vacuum;
+a single-vacuum request does not start monitoring for other vacuums. Homebridge's
+accessories endpoint may itself read accessories belonging to other vacuums.
 
-Completed operations retain their snapshots and are checked approximately every
-five minutes. A later disagreement changes status to `needs-attention` and corrects
-the displayed Pause All state. These checks do not overwrite possible manual edits.
-A plugin rollback after settlement is indistinguishable from a manual edit, so it
-is reported rather than automatically reversed. Repeated presses adopt an existing
-operation without resetting its retry budget. Opposite requests supersede unfinished
-operations; an OFF request is persisted before discovery so an outage at midnight
-does not leave automatic pause retries running.
+Settlement requires at least three matching observations spanning two minutes,
+and cannot happen before six minutes from the request. This allows time beyond
+the plugin's default five-minute schedule cache. Cached values and background
+refreshes mean this is still best-effort verification, not guaranteed completion.
+Avoid editing schedules manually while an operation is settling. Only mismatched
+schedules are retried, at least two minutes apart, with at most three attempts per
+schedule per operation. After settlement, remaining checks in the same window
+are read-only: possible manual changes are reported, not overwritten.
+
+At the deadline, all background reads and retries stop. An already submitted HTTP
+request may finish; the controller starts no further request after expiry. A
+settled operation retains its last observed result. An unsettled one becomes
+`needs-attention`, with its recovery snapshot preserved. A restart resumes only
+the unused part of an existing window; it does not grant another ten minutes.
+Stopping and restarting the timer cannot renew a window.
+
+Repeated presses while a window is open preserve its deadline and retry budget.
+After an unsuccessful window, explicitly retry the same ON/OFF request to open a
+new window. `reconcile` explicitly rechecks the saved requested operation, including
+a failed restore. Opposite requests supersede unfinished work; OFF is persisted
+before discovery so an outage at midnight cannot continue the old pause retries.
+A repeated request for an already completed operation is a no-op.
 
 During settlement the switch displays the requested state. On a known disagreement
-requiring attention it reflects whether Homebridge shows that vacuum's schedules
-all OFF; the aggregate switch is ON if any vacuum reports ON. The persisted
-`pauseActive` field separately records restoration ownership and must not be used
-as proof that schedules are disabled. Existing completed pauses are adopted for
-read-only monitoring; recorded incomplete activations may resume.
+requiring attention it reflects whether Homebridge last showed that vacuum's
+schedules all OFF; Pause All is ON if any vacuum reports ON. A discovery-only pause
+that times out before any writes displays OFF and retains a `needs-attention`
+request that can be retried or cancelled with OFF. `pauseActive` separately records
+restoration ownership; it is not proof that schedules are disabled.
+
+**After the window closes, the displayed state is the last observation, not a
+continuously refreshed status.** Later cloud failures or manual edits are not
+detected automatically. Fix connectivity and explicitly retry or restore if needed;
+do not delete recovery files. On upgrading from v1.0.1, old journals without a
+deadline stop their indefinite audits immediately. Completed results remain saved;
+unfinished journals become `needs-attention` and need an explicit retry. Legacy
+snapshots without a journal remain restorable and are not automatically polled.
 
 When Homebridge displays the schedules OFF, a cleaning vacuum receives one Return
 to Dock request. `return-to-dock-submitted` means Homebridge accepted the press,
@@ -571,10 +598,10 @@ mean that schedules have settled.
 Background output is written privately to
 `controller/all-vacuums-pause-operation.log`; the state command continues to
 report the persisted controller view as the operation progresses. To inspect the
-per-vacuum phase, desired state and latest error, run
+per-vacuum phase, desired state, verification window and latest error, run
 `python3 controller/all-vacuums-pause-controller.py status` from the installed root.
 `maintain` performs one reconciliation cycle; normal periodic use is owned by the
-new systemd timer, not by a HomeKit state-read callback.
+systemd timer, not by a HomeKit state-read callback.
 
 The renderer and installer stage now include both reconciliation unit files in
 addition to the midnight units. Review and install the generated

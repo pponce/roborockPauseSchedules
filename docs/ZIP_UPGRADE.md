@@ -11,15 +11,15 @@ and the Script2 command paths.
 
 ## 1. Download and inspect the new release
 
-Download the attached `roborockPauseSchedules-1.0.1.zip` and matching
+Download the attached `roborockPauseSchedules-1.0.2.zip` and matching
 `.zip.sha256` from [Releases](https://github.com/pponce/roborockPauseSchedules/releases).
 From the download directory, verify and extract into a separate, empty staging
 directory, not over the running controller:
 
 ```bash
-sha256sum --check roborockPauseSchedules-1.0.1.zip.sha256 &&
-unzip -l roborockPauseSchedules-1.0.1.zip &&
-unzip roborockPauseSchedules-1.0.1.zip -d ./roborock-upgrade-review
+sha256sum --check roborockPauseSchedules-1.0.2.zip.sha256 &&
+unzip -l roborockPauseSchedules-1.0.2.zip &&
+unzip roborockPauseSchedules-1.0.2.zip -d ./roborock-upgrade-review
 ```
 
 Review the release notes and compare program files with your installation.
@@ -66,7 +66,7 @@ below with your actual reviewed directory:
 
 ```bash
 sudo -H -u homebridge cp -a \
-  /absolute/path/roborock-upgrade-review/roborockPauseSchedules-1.0.1/. \
+  /absolute/path/roborock-upgrade-review/roborockPauseSchedules-1.0.2/. \
   /var/lib/homebridge/roborockPauseSchedules/
 ```
 
@@ -115,8 +115,11 @@ reinstalled merely to add it.
 After successful verification, enable the reconciliation timer, restore the
 midnight timer if previously in use, and restart Homebridge if you stopped it.
 The midnight timer can immediately run a missed expiration when restarted.
-Re-enabling reconciliation can resume a durable unfinished request; it is not
-just a status query.
+Re-enabling reconciliation resumes only a request still inside its original
+ten-minute window. Expired requests do not restart automatically. v1.0.1 journals
+without deadlines stop their old indefinite audits; incomplete journals need an
+explicit retry. No snapshot is discarded. The v1.0.1 systemd unit contents are
+unchanged, so an existing verified timer needs no replacement.
 
 ## If validation fails
 

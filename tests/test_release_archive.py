@@ -27,6 +27,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                 "systemd/roborock-pause-until-tomorrow.service",
                 "systemd/roborock-pause-until-tomorrow.timer",
                 "docs/ZIP_UPGRADE.md",
+                "docs/RELEASE_1.0.2.md",
             ):
                 self.assertIn(prefix + relative, names)
             self.assertFalse(any("tests/" in name for name in names))

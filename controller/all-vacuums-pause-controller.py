@@ -55,7 +55,7 @@ def load_vacuum_state(vacuum):
 
     state["transactionStatus"] = "inactive"
     if state.get("pendingActivation") is True:
-        state["transactionStatus"] = "planning"
+        state["transactionStatus"] = ("needs-attention" if state.get("pendingActivationWindow", {}).get("closed", False) else "planning")
         return state
     if state["pauseActive"]:
         state["transactionStatus"] = validate_active_snapshot(vacuum, state)
@@ -149,7 +149,9 @@ def read_states():
 
 
 def display_state(state):
-    return state.get("pendingActivation") is True or state.get("operation", {}).get("displayPause", state["pauseActive"])
+    if state.get("pendingActivation") is True:
+        return not state.get("pendingActivationWindow", {}).get("closed", False)
+    return state.get("operation", {}).get("displayPause", state["pauseActive"])
 
 
 def read_state_details():
